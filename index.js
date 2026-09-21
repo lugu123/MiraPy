@@ -168342,18 +168342,9 @@ function Q2r(e) {
   }
   function g(ce) {
     if (!ce?.IndexNumber)return "";
-    let J=ce.Name||`\u7B2C${ce.IndexNumber||0}\u96C6`, se=ce.MediaSources||[];
-    if (se.length>1) {
-      let H=se.map(($, ne)=> {
-        let O=$.Name||`\u7248\u672C${ne+1}`, U=`${ce.Id}|${$.Id}`;
-        return `${O}$${U}`
-      });
-      return H.length>0?`${J}@@${H.join("#")}`:""
-    }
-    if (se.length===1) {
-      let H=se[0], $=H.Name||J, ne=`${ce.Id}|${H.Id}`;
-      return `${$}$${ne}`
-    }
+    let J=ce.Name||`\u7B2C${ce.IndexNumber||0}\u96C6`;
+    // 剧集详情只编码“季 → 集”。媒体源/画质延后到 /play，避免 @@ 版本嵌套干扰季集选择。
+    if (ce.Id)return `${J}$${ce.Id}`;
     let fe=rXe(t, n, ce.Id, null, t.userId);
     return `${J}$${fe}`
   }
@@ -168386,7 +168377,7 @@ function Q2r(e) {
     return H.slice(0, p)
   }
   async function E(ce, J) {
-    let se="Id,Name,IndexNumber,ParentIndexNumber,SeasonId,SeasonName,MediaSources", fe=n(`/Shows/${ce}/Episodes`);
+    let se="Id,Name,IndexNumber,ParentIndexNumber,SeasonId,SeasonName", fe=n(`/Shows/${ce}/Episodes`);
     try {
       let $=await y(fe, {UserId:t.userId, Fields:se, SortBy:"ParentIndexNumber,IndexNumber", SortOrder:"Ascending"}, J,
         "medium");
@@ -168635,6 +168626,9 @@ function Q2r(e) {
       fe=ne[ne.length-2], H=$.searchParams.get("MediaSourceId")
     } catch {
       return {parse:1, url:se, header:i}
+    } else if (!/[/?#]/.test(se)) {
+      // 剧集选集只传 Emby ItemId；具体媒体源在播放页再解析。
+      fe=se, H=null
     } else return {parse:1, url:se, header:i};
     try {
       let $=await s(), ne={DeviceProfile:{MaxStreamingBitrate:14e7, DirectPlayProfiles:[{Container:"mp4,mkv,m4v", Type:"Video"}]}},
@@ -168646,12 +168640,34 @@ function Q2r(e) {
       t.enablePlaybackReport&&o.recordPlaybackStart(fe, K).then(Z=> {
         q=Z
       }).catch (()=> {});
-      let ee=le(K, q);
-      return ee||{parse:0, url:vdi(t, K), header:i, extra:{mediaSourceId:K.Id, playbackSessionId:q}}
+      if (!H&&j.length>1) {
+        let B=[], BHeader=i, seen=new Set;
+        j.forEach((Z, ne)=> {
+          let Oe=sourceResult(Z, null);
+          if (!Oe||!Oe.url)return;
+          B.length===0&&Oe.header&&(BHeader=Oe.header);
+          let Ue=sourceLabel(Z, ne);
+          seen.has(Ue)&&(Ue+=` (${ne+1})`), seen.add(Ue), B.push(Ue, Oe.url)
+        });
+        if (B.length>=4)return {parse:0, url:B, header:BHeader, extra:{mediaSourceId:K.Id, sourceCount:B.length/2, playbackSessionId:q}}
+      }
+      return sourceResult(K, q)||{parse:0, url:vdi(t, K), header:i, extra:{mediaSourceId:K.Id, playbackSessionId:q}}
     } catch ($) {
       return console.debug("\u64AD\u653E\u8BF7\u6C42\u5931\u8D25:", $.message), {parse:0, url:t.isJellyfin?`${t.server}/Videos/${fe}/stream?api_key=${t.token}`:`${t.server}/emby/videos/${fe}/stream?api_key=${t.token}`,
         header:i}
     }
+  }
+  function sourceLabel(ce, J) {
+    let se=String(ce?.Name||"").trim();
+    if (se)return se;
+    let fe=Array.isArray(ce?.MediaStreams)?ce.MediaStreams.find(H=>String(H?.Type||"").toLowerCase()==="video"):null, H=Number(fe?.Height||0);
+    return H>=2160?"2160p":H>=1440?"1440p":H>=1080?"1080p":H>=720?"720p":H>0?`${H}p`:`Version ${J+1}`
+  }
+  function sourceResult(ce, J) {
+    let se=le(ce, J);
+    if (se)return se;
+    let fe=vdi(t, ce);
+    return fe?{parse:0, url:fe, header:{...i, Referer:`${t.server}/`}, extra:{mediaSourceId:ce.Id, playbackSessionId:J}}:null
   }
   function le(ce, J) {
     return ce.DirectStreamUrl?{parse:0, url:ce.DirectStreamUrl.startsWith("http")?ce.DirectStreamUrl:t.server+ce.DirectStreamUrl,
