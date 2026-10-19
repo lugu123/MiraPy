@@ -14,7 +14,7 @@
 > 占位站源改名后 KEY 也变了，如果站源页原先勾选过 `20260923`，需要**重新启用一次 `20261019`**。
 
 - 只替换 `index.js`；`index.config.js` 未改动（md5 `36c17715d0157884b6b0cddb5ab2f29a`）
-- 新 `index.js` md5：`606f4dbb305df0f64da88c7bd16f1eb1`（14.03 MB，`node --check` 通过）
+- 新 `index.js` md5：`8299e6f73b968725691b17bf261d33f0`（14.03 MB，`node --check` 通过）
 
 ---
 
@@ -202,24 +202,45 @@ YouTube 配置页现在有四个动作按钮，对着 902 截图做的：
 
 ---
 
-## 0-C. 备份：插件配置 + 本地 js + 猫源 zip 一起导出
+## 0-C. 备份：配置 + 本地 js + 猫源 zip 打成一个压缩包
 
-「导出」与「WebDAV 备份」原来只 dump 数据库 JSON，磁盘上的文件不会进去。现在两处都补上了：
+「导出」现在直接给一个 **zip 压缩包**（不再是纯 JSON），「导入」也认 zip：
 
-| 内容 | 来源 | 备份后位置 |
+```
+catpaw-backup-2026-10-19.zip
+├── backup.json                       ← 原来的数据库配置
+├── js/磁力熊.js                       ← 外部接口 → 本地 JS
+├── js/4K原盘.js
+└── catpaw_interfaces/
+    └── cpi_xxxxxxxx/source.zip       ← 猫源接口的本地包
+```
+
+| 内容 | 来源 | 包内位置 |
 | --- | --- | --- |
-| youtube / torrentio / hdhub / 磁力配置 | 数据库 `/youtube`、`/torrentio`、`/hdhub`、`/torrent/config` | JSON 顶层同名对象（导出时若缺失会主动补读一次） |
-| 本地 JS（外部接口 → 本地 JS） | `<NODE_PATH>/js/*.js` | `__lmFiles[]`（`rel` + `size` + `base64`） |
-| 猫源接口的本地 ZIP | `<CATPAW_INTERFACE_CACHE_DIR 或 NODE_PATH>/catpaw_interfaces/**/*.zip` | 同上 |
+| youtube / torrentio / hdhub / 磁力配置 | 数据库 `/youtube`、`/torrentio`、`/hdhub`、`/torrent/config` | `backup.json` 顶层同名对象（缺失时主动补读一次） |
+| 本地 JS | `<NODE_PATH>/js/*.js` | `js/*.js` |
+| 猫源本地 ZIP | `<CATPAW_INTERFACE_CACHE_DIR 或 NODE_PATH>/catpaw_interfaces/**/*.zip` | 原目录结构 |
 
-- **导出**：`GET /backup/` 的 JSON 里多一个 `__lmFiles` 数组；
-- **导入**：`PUT /backup/` 会先把 `__lmFiles` 写回磁盘，再把配置写进数据库（导入请求体上限已放宽到 32MB）；
-- **WebDAV**：手动 / 自动快照（`kjr`）使用同一份 JSON，因此同样包含文件；从 WebDAV 恢复（`Mjr`）也会还原本地文件。
+四条链路：
 
-限制（防止把备份文件撑爆，也防止越权写文件）：
+- **导出**：`GET /backup/` → `application/zip`，文件名 `catpaw-backup-日期.zip`；
+- **导入**：`PUT /backup/` 接受 zip（前端把文件转成 base64 提交）或旧的纯 JSON，两种都能用；
+- **WebDAV 快照**：手动 / 自动备份上传的也是 zip（`backup-日期-时间.zip` / `auto-日期.zip`）；
+- **WebDAV 恢复**：按内容识别，zip 解包还原文件后写配置；旧的 `.json` 备份仍然可以恢复。
 
-- 单个文件 ≤ 16MB，合计 ≤ 16MB（超出部分会跳过，不影响其余配置）；
-- 只接受 `.js` 与 `.zip`；路径禁止 `..`、禁止绝对路径，写入前统一以 `NODE_PATH` 为根。
+实现说明（为什么不是把文件塞进 JSON）：
+
+- 之前是 `__lmFiles`（base64 数组）塞在 JSON 里，体积涨 33% 且只能靠程序解；
+  现在换成标准 zip，**用系统解压工具也能直接打开看**；
+- zip 写入用 STORE / DEFLATE 两种方式（能压就压），解包支持 STORE + DEFLATE，不依赖第三方库；
+- 文件名带 UTF-8 标志位，中文名在 Windows / macOS 解压都不会乱码。
+
+安全与容量：
+
+- 单文件 ≤ 64MB、合计 ≤ 256MB（超出跳过，不影响其它条目）；
+- 还原时只认 `js/*.js` 与 `catpaw_interfaces/**/*.zip`，其余（含 `backup.json`）不会被写到磁盘；
+- 路径禁止 `..`、禁止绝对路径与盘符，写入统一以 `NODE_PATH` 为根。
+
 
 ---
 
@@ -262,7 +283,7 @@ YouTube 配置页现在有四个动作按钮，对着 902 截图做的：
 ## 5. 安装
 
 1. 关闭引擎；
-2. 用本包 `index.js` 覆盖，`index.js.md5` 一并覆盖（内容 `606f4dbb305df0f64da88c7bd16f1eb1`）；
+2. 用本包 `index.js` 覆盖，`index.js.md5` 一并覆盖（内容 `8299e6f73b968725691b17bf261d33f0`）；
 3. `index.config.js` 不用替换；
 4. 启动后进「站源」，可见 `YouTube / Torrentio / HdHub`，点「配置」打开各自页面。
 
