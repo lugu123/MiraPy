@@ -14,7 +14,7 @@
 > 占位站源改名后 KEY 也变了，如果站源页原先勾选过 `20260923`，需要**重新启用一次 `20261019`**。
 
 - 只替换 `index.js`；`index.config.js` 未改动（md5 `36c17715d0157884b6b0cddb5ab2f29a`）
-- 新 `index.js` md5：`8299e6f73b968725691b17bf261d33f0`（14.03 MB，`node --check` 通过）
+- 新 `index.js` md5：`c3756c143c1c29e15bd6fc1b163e322f`（14.03 MB，`node --check` 通过）
 
 ---
 
@@ -223,7 +223,7 @@ catpaw-backup-2026-10-19.zip
 
 四条链路：
 
-- **导出**：`GET /backup/` → `application/zip`，文件名 `catpaw-backup-日期.zip`；
+- **导出**：`GET /backup`（`/backup/` 同样注册）→ `application/zip`，文件名 `catpaw-backup-日期.zip`；
 - **导入**：`PUT /backup/` 接受 zip（前端把文件转成 base64 提交）或旧的纯 JSON，两种都能用；
 - **WebDAV 快照**：手动 / 自动备份上传的也是 zip（`backup-日期-时间.zip` / `auto-日期.zip`）；
 - **WebDAV 恢复**：按内容识别，zip 解包还原文件后写配置；旧的 `.json` 备份仍然可以恢复。
@@ -234,6 +234,11 @@ catpaw-backup-2026-10-19.zip
   现在换成标准 zip，**用系统解压工具也能直接打开看**；
 - zip 写入用 STORE / DEFLATE 两种方式（能压就压），解包支持 STORE + DEFLATE，不依赖第三方库；
 - 文件名带 UTF-8 标志位，中文名在 Windows / macOS 解压都不会乱码。
+
+补充：原版是用 `register(N0t,{prefix:"/backup"})` 挂的，某些引擎版本里这条路由没落到 `/backup/` 上，
+点「导出」会直接看到 fastify 的 `{"message":"Route GET:/backup/ not found","statusCode":404}`。
+现在启动时会把 **`/backup` 与 `/backup/` 的 GET / PUT 都注册一遍**（已存在就跳过，不冲突），
+启动日志会打印 `[backup] 备份路由已注册（/backup 与 /backup/，成功 N 条）`。
 
 安全与容量：
 
@@ -283,7 +288,7 @@ catpaw-backup-2026-10-19.zip
 ## 5. 安装
 
 1. 关闭引擎；
-2. 用本包 `index.js` 覆盖，`index.js.md5` 一并覆盖（内容 `8299e6f73b968725691b17bf261d33f0`）；
+2. 用本包 `index.js` 覆盖，`index.js.md5` 一并覆盖（内容 `c3756c143c1c29e15bd6fc1b163e322f`）；
 3. `index.config.js` 不用替换；
 4. 启动后进「站源」，可见 `YouTube / Torrentio / HdHub`，点「配置」打开各自页面。
 
