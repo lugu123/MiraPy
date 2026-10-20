@@ -2699,6 +2699,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmYoutubeM
             { k: "metadataTimeout", label: "取元数据超时（毫秒）", type: "number", ph: "45000" },
             { k: "gateTimeout", label: "起播前有源探测（毫秒）", type: "number", ph: "8000" },
             { k: "noPeerGrace", label: "无 peer 宽限（毫秒）", type: "number", ph: "2500" },
+            { k: "mqParallel", label: "剧集画质并发解析档数", type: "number", ph: "3", note: "播放页同时解析几个画质（2-6）。数值越大画质菜单越全，但起播越慢" },
+            { k: "mqTimeout", label: "剧集每档解析超时（毫秒）", type: "number", ph: "18000", note: "播放页解析画质的最长等待；到点没解析出来的画质不出现在菜单里" },
             { k: "savePath", label: "缓存目录", type: "text", ph: "留空=引擎目录下的 torrent-cache" }
           ]
         }
@@ -4675,6 +4677,9 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       onlyChineseSub: false,
       maxResults: 40,
       trackerMode: "auto",
+      // 剧集播放页多画质：并发解析几档、每档等多久（毫秒）
+      mqParallel: 3,
+      mqTimeout: 18000,
       intercept: true,
       dht: true,
       gate: true,
@@ -4897,6 +4902,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       out.uploadLimit = num(out.uploadLimit, 1048576);
       out.maxTorrents = Math.max(1, num(out.maxTorrents, 10));
       out.maxConns = Math.min(200, Math.max(6, num(out.maxConns, 20)));
+      out.mqParallel = Math.min(6, Math.max(2, num(out.mqParallel, 3)));
+      out.mqTimeout = Math.max(5000, num(out.mqTimeout, 18000));
       out.intercept = bool(out.intercept, true);
       out.dht = bool(out.dht, true);
       out.gate = bool(out.gate, true);
@@ -5005,6 +5012,93 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       return kept;
     }
 
+    /**
+     * 画质筛写的别名归一化。
+     * 用户习惯写 2160p / 4K / UHD / DV / HDR 这些常见说法，而 Torrentio 的 qualityfilter
+     * 只认 4k / 1080p / dolbyvision / hdrall 这类固定词。以前遇到别名会静默丢弃，
+     * 看起来就是「配置了但没生效」，所以这里统一翻译成服务端认的写法。
+     */
+    var QUALITY_ALIASES = {
+      "2160p": "4k", "2160": "4k", "uhd": "4k", "4k": "4k", "2160p.": "4k",
+      "1080": "1080p", "fhd": "1080p", "1080p": "1080p",
+      "720": "720p", "hd": "720p", "720p": "720p",
+      "480": "480p", "sd": "480p", "480p": "480p",
+      "dv": "dolbyvision", "杜比视界": "dolbyvision", "dolby": "dolbyvision", "dolbyvision": "dolbyvision",
+      "dv+hdr": "dolbyvisionwithhdr", "dolbyvisionwithhdr": "dolbyvisionwithhdr",
+      "hdr": "hdrall", "hdrall": "hdrall", "hdr10": "hdrall", "hdr10+": "hdrall",
+      "remux": "brremux", "brremux": "brremux", "bdremux": "brremux",
+      "3d": "threed", "threed": "threed", "non3d": "nonthreed", "nonthreed": "nonthreed",
+      "other": "other", "其他": "other", "unknown": "unknown", "未知": "unknown",
+      "cam": "cam", "枪版": "cam", "scr": "scr", "scrts": "scr", "ts": "scr", "tc": "scr", "抢先版": "scr"
+    };
+    /** 解析「排除画质」：先归一化别名，再交给 Torrentio；无法识别的值会告警并丢弃 */
+    function parseQualityFilter(text) {
+      var raw = str(text).trim();
+      if (!raw) return [];
+      var kept = [];
+      raw.split(/[,|\s]+/).forEach(function (token) {
+        var name = str(token).trim().toLowerCase();
+        if (!name) return;
+        var mapped = QUALITY_ALIASES[name] || name;
+        if (QUALITY_FILTERS.indexOf(mapped) < 0) {
+          warn("忽略无效的画质筛选：" + name + "（可用：4k/1080p/720p/480p/brremux/hdrall/dolbyvision/scr/cam/other/unknown）");
+          return;
+        }
+        if (kept.indexOf(mapped) < 0) kept.push(mapped);
+      });
+      return kept;
+    }
+
+    /**
+     * 一条流的画质属性，用于本地复核「排除画质」。
+     * 服务端过滤并非 100%（实测 qualityfilter=4k 后仍有少量 4K 漏过），
+     * 而且用户改了配置可能看不懂为什么还有，所以本地再挡一次。
+     */
+    function qualityAttrs(info) {
+      var i = info || {};
+      var blob = [i.quality, i.name, i.filename, i.rawTitle].filter(Boolean).join(" ").toLowerCase();
+      var tags = qualityTags(blob).map(function (t) { return t.toLowerCase(); });
+      var res = "other";
+      if (/\b4k\b|2160|\buhd\b/.test(blob)) res = "4k";
+      else if (/1080/.test(blob)) res = "1080p";
+      else if (/720/.test(blob)) res = "720p";
+      else if (/480/.test(blob)) res = "480p";
+      var isDv = tags.indexOf("杜比视界") >= 0;
+      var isHdr = /hdr/.test(tags.join(" ")) || isDv;
+      return {
+        res: res,
+        dv: isDv,
+        hdr: isHdr,
+        remux: /remux/i.test(blob),
+        threeD: /\b3d\b|three[\s._-]?d|half[\s._-]?sbs|\bhsbs\b|\b3dhsbs\b/i.test(blob),
+        cam: /(^|[^a-z])(cam|camrip|hdcam|hdts)([^a-z]|$)/i.test(blob),
+        scr: /(^|[^a-z])(scr|screener|dvdscr|bdscr|tc|ts|telesync|telecine)([^a-z]|$)/i.test(blob)
+      };
+    }
+    /** 该流是否命中「排除画质」列表 */
+    function isQualityExcluded(info, excluded) {
+      if (!Array.isArray(excluded) || !excluded.length) return false;
+      var a = qualityAttrs(info);
+      for (var k = 0; k < excluded.length; k++) {
+        var f = excluded[k];
+        if (f === "4k" && a.res === "4k") return true;
+        if (f === "1080p" && a.res === "1080p") return true;
+        if (f === "720p" && a.res === "720p") return true;
+        if (f === "480p" && a.res === "480p") return true;
+        if (f === "other" && a.res === "other") return true;
+        if (f === "unknown" && a.res === "other") return true;
+        if (f === "dolbyvision" && a.dv) return true;
+        if (f === "dolbyvisionwithhdr" && a.dv && a.hdr) return true;
+        if (f === "hdrall" && a.hdr) return true;
+        if (f === "brremux" && a.remux) return true;
+        if (f === "threed" && a.threeD) return true;
+        if (f === "nonthreed" && !a.threeD) return true;
+        if (f === "cam" && a.cam) return true;
+        if (f === "scr" && a.scr) return true;
+      }
+      return false;
+    }
+
     function debridCredential() {
       var raw = str(cfg.debridKey).trim();
       if (!raw) return { provider: "", key: "" };
@@ -5034,8 +5128,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       // language：Torrentio 只看第一个语种
       var langs = parseCsvList(cfg.language, LANGUAGES, "语种");
       if (langs.length) segs.push("language=" + langs[0]);
-      // qualityfilter：写的是「要排除」的画质
-      var excluded = parseCsvList(cfg.excludeQuality, QUALITY_FILTERS, "画质");
+      // qualityfilter：写的是「要排除」的画质。用归一化解析，支持 2160p / DV / HDR 这类常见写法
+      var excluded = parseQualityFilter(cfg.excludeQuality);
       if (excluded.length) segs.push("qualityfilter=" + excluded.join(","));
       // limit：源码正则是 /^[1-9][0-9]*$/，这里收窄到 999 防误填
       var limit = str(cfg.limit).trim();
@@ -5194,7 +5288,9 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
         name: name, seeders: seeders, sizeText: sizeText, sizeBytes: sizeBytes,
         provider: provider, quality: quality, flags: flagLine,
         isDebrid: isDebridDirectUrl(stream.url), isPack: isPack,
-        filename: filePart || ""
+        filename: filePart || "",
+        // 发布名原文（含 2160p / HEVC / DV / DDP 之类的细节），画质标签要用
+        rawTitle: title
       };
     }
 
@@ -5207,6 +5303,61 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       var unit = m[2].toUpperCase() === "KB" ? "KB" : m[2].toUpperCase();
       var scale = { B: 1, KB: 1024, MB: 1048576, GB: 1073741824, TB: 1099511627776 };
       return v * (scale[unit] || 0);
+    }
+
+    /**
+     * 画质细节标记：从资源名里抽出「杜比视界 / HDR / 色深 / 编码 / 音轨」。
+     * Torrentio 的 name 只给粗略档位（如「4k DV | HDR」），细节都在 title 的发布名与 filename 里，
+     * 所以三处一起扫。返回顺序固定：动态范围 → 色深 → 视频编码 → 音频编码，方便横向比较。
+     */
+    function qualityTags(text) {
+      var t = str(text);
+      if (!t) return [];
+      var out = [];
+      // 动态范围：DV 优先（同时是 HDR），HDR10+ 比 HDR10 更强，只留更精确的那个
+      if (/dolby[\s._-]*vision|\bdv\b|杜比视界/i.test(t)) out.push("杜比视界");
+      if (/hdr10\+|hdr10p|hdr\s*10\s*\+/i.test(t)) out.push("HDR10+");
+      else if (/\bhdr\b|hdr10|杜比视界|dolby[\s._-]*vision/i.test(t)) out.push("HDR");
+      if (/\bhlg\b/i.test(t)) out.push("HLG");
+      // 色深
+      if (/10[\s._-]?bits?\b|\b10bit\b/i.test(t)) out.push("10bit");
+      // 视频编码
+      if (/hevc|h[\s._-]?265|x265/i.test(t)) out.push("HEVC");
+      else if (/\bav1\b/i.test(t)) out.push("AV1");
+      else if (/h[\s._-]?264|x264|\bavc\b/i.test(t)) out.push("H264");
+      else if (/\bvp9\b/i.test(t)) out.push("VP9");
+      // 音频编码（只取最强的那个，避免标签过长）
+      if (/atmos|全景声/i.test(t)) out.push("Atmos");
+      else if (/dts[\s._-]*hd|dts[\s._-]*x/i.test(t)) out.push("DTS-HD");
+      else if (/truehd/i.test(t)) out.push("TrueHD");
+      else if (/ddp|eac3|dd\+|dolby[\s._-]*digital[\s._-]*plus/i.test(t)) out.push("DD+");
+      else if (/\bdts\b/i.test(t)) out.push("DTS");
+      else if (/\bac3\b/i.test(t)) out.push("AC3");
+      return out;
+    }
+
+    /** 一条流的完整画质描述文本：档位 + 细节标记（去重、限长） */
+    function qualityLabelOf(tierLabel, info) {
+      var info2 = info || {};
+      var blob = [info2.quality, info2.name, info2.filename, info2.rawTitle].filter(Boolean).join(" ");
+      var tags = qualityTags(blob);
+      // 「其他」没有分辨率可言（BDRip / HDRip / DVDRip 这类老片源），用它自己的片源标识当档位更好认
+      var head = tierLabel;
+      if (!head || head === "其他") {
+        var raw = str(info2.quality).split(" / ")[0].trim();
+        head = raw && !/^其他$/.test(raw) ? raw : (head || "");
+      }
+      // 档位本身已经写明 4K/1080P 时，不再重复分辨率；HDR 类标记放最前面最显眼
+      var parts = [head].concat(tags).filter(Boolean);
+      // 同一语义只留一个（比如档位已含 DV 时不再重复）
+      var seen = {}, out = [];
+      parts.forEach(function (p) {
+        var k = String(p).toLowerCase();
+        if (seen[k]) return;
+        seen[k] = 1;
+        out.push(p);
+      });
+      return out.join(" ").replace(/[$#]/g, " ").trim().slice(0, 42);
     }
 
     function describeStream(info) {
@@ -5261,10 +5412,11 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
         }
         usable.push(s);
       });
-      var result = { streams: [], errorText: errorText, skipped: { hash: 0, disk: 0, cjk: 0, content: 0, url: 0 } };
+      var result = { streams: [], errorText: errorText, skipped: { hash: 0, disk: 0, cjk: 0, content: 0, quality: 0, url: 0 } };
       if (!usable.length) return result;
 
       var maxDiskGb = parseFloat(cfg.maxDisk);
+      var excludedQuality = parseQualityFilter(cfg.excludeQuality);
       var diskLimit = isFinite(maxDiskGb) && maxDiskGb > 0 ? maxDiskGb * 1073741824 : null;
       var onlyCjk = !!cfg.onlyChineseSub;
       var contentFilter = str(cfg.contentFilter || "all");
@@ -5298,6 +5450,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
         if (contentFilter === "pack" && !info.isPack) { result.skipped.content++; continue; }
         if (contentFilter === "episode" && info.isPack) { result.skipped.content++; continue; }
         if (contentFilter === "debrid" && !info.isDebrid) { result.skipped.content++; continue; }
+        // 排除画质：服务端 qualityfilter 已挡过一道，这里本地再复核（实测服务端会漏少量条目）
+        if (isQualityExcluded(info, excludedQuality)) { result.skipped.quality++; continue; }
 
         result.streams.push({ stream: stream, info: info, magnet: magnet, url: url, hash: hash, fileIdx: Number(stream.fileIdx) >= 0 ? Number(stream.fileIdx) : null });
       }
@@ -5314,6 +5468,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       if (sk.disk) d.push("体积超限 " + sk.disk);
       if (sk.cjk) d.push("无中/日/韩标记 " + sk.cjk);
       if (sk.content) d.push("被内容筛选排除 " + sk.content);
+      if (sk.quality) d.push("画质被排除 " + sk.quality);
       if (sk.url) d.push("地址不可用 " + sk.url);
       return d.join("，");
     }
@@ -5512,6 +5667,9 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       var vote = Number(item.vote_average || 0);
       var poster = str(item.poster_path || "");
       return {
+        // ★ 保留 TMDB 原始条目（genre_ids / popularity / vote_count），搜索排序要用它判断
+        //   「片名撞车时谁才是正主」（TMDB 有空壳条目：片名对，但无类型、无年份、零票）
+        tmdbItem: item,
         vod_id: "tmdb:" + kind + ":" + item.id,
         vod_name: name,
         vod_pic: poster ? ("https://image.tmdb.org/t/p/w342" + poster) : "",
@@ -5670,9 +5828,415 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       return s;
     }
 
-    /** 关键词 → TMDB 条目（中文优先，返回 {list, total, totalPages}） */
+    /** 中文数字 → 整数（支持 零~九十九 的常见写法：四、十、十一、二十三） */
+    function cnNum(text) {
+      var t = str(text).replace(/\s+/g, "");
+      if (!t) return 0;
+      if (/^\d+$/.test(t)) return parseInt(t, 10);
+      var map = { "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9 };
+      var m = t.match(/^([一二两三四五六七八九])?十([一二三四五六七八九])?$/);
+      if (m) return (m[1] ? map[m[1]] : 1) * 10 + (m[2] ? map[m[2]] : 0);
+      if (t.length === 1 && map[t] !== undefined) return map[t];
+      return 0;
+    }
+
+    /**
+     * 搜索候选词列表（按优先级）：原词 → 剥掉季数的片名 → 去掉标点/空格的版本。
+     * ★ 原词必须排第一：片名本身带数字时（海王2、蛟龙行动2）原词才是对的，
+     *   直接剥季数会把它搜成「海王」，命中一堆不相干的老片。
+     */
+
+    /* ================= 季数感知搜索内核（片名 + 第N季） ================= */
+    /* 旧实现「原词优先，原词 0 命中才剥季数」有三个问题：
+       ① 剥季数只认空格分隔，中文习惯的「侠探杰克第四季」「片名（第四季）」「Reacher S4」剥不掉；
+       ② 只要原词有任意命中就再也不试剥季后的片名；
+       ③ 剥季后不考虑「同名多部」（海贼王 1999 / 2023），目标条目常被挤到第 2 页。
+       下面统一处理：识别季 → 剥季 → 出候选 → 打分排序。 */
+
+    /** 中文数字 → 整数（只覆盖季数里出现的 1~99：四、十、十一、二十三） */
+    var SP_CN = { "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9 };
+    function spCnNum(t) {
+      t = String(t == null ? "" : t).replace(/\s+/g, "");
+      if (!t) return 0;
+      if (/^\d+$/.test(t)) return parseInt(t, 10);
+      var m = t.match(/^([一二两三四五六七八九])?十([一二三四五六七八九])?$/);
+      if (m) return (m[1] ? SP_CN[m[1]] : 1) * 10 + (m[2] ? SP_CN[m[2]] : 0);
+      if (t.length === 1 && SP_CN[t] !== undefined) return SP_CN[t];
+      return 0;
+    }
+
+    function spNowYear() { return new Date().getFullYear(); }
+
+    /** 统一成半角、单空格（全角括号留着，交给 spUnbracket 决定去留） */
+    function spCleanQuery(x) {
+      return String(x == null ? "" : x)
+        .replace(/[\uFF01-\uFF5E]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
+        .replace(/\u3000/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    /** 括号里的内容拆出来（「片名（第四季）」→「片名 第四季」），后面统一由剥季处理 */
+    function spUnbracket(t) {
+      return String(t || "")
+        .replace(/[（(]\s*([^（）()]{1,80}?)\s*[）)]/g, " $1 ")
+        .replace(/【\s*([^【】]{1,80}?)\s*】/g, " $1 ")
+        .trim();
+    }
+
+    /**
+     * 从查询里识别「季」并返回剥离后的片名 → { title, season }。
+     * 支持：第四季 / 第 4 季 / 第四期 / 第四部(非「部分」) / Season 4 / season4 / S04 / 片名（第四季）
+     *      片名-S4 / 片名 S4 / 片名 4（裸数字必须带空格）
+     * 防误伤：海王2、蛟龙行动2 这种片名自带数字不会被剥（没有空格不算季数），
+     *        而且调用方永远把原词也放进候选，真剥错也能救回来。
+     */
+    function findSeasonTag(wd) {
+      var raw = String(wd == null ? "" : wd).trim();
+      if (!raw) return { title: "", season: 0 };
+      var t = spCleanQuery(spUnbracket(raw));
+      var season = 0, hit = "";
+      var pats = [
+        /第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部](?!分)/,  // 第四季
+        /(?:^|[^a-z])season\s*([0-9]{1,2})(?![0-9])/i,                          // Season 4
+        /([0-9]{1,2})\s*season(?![a-z])/i,                                        // 4 Season
+        /(?:^|[^a-z0-9])s\s?([0-9]{1,2})(?![0-9a-z])/i,                           // S04 / S4
+        /([0-9]{1,2})\s?s\s?([0-9]{1,3})(?![0-9a-z])/i                            // 4s1 / 4s01
+      ];
+      for (var i = 0; i < pats.length && !season; i++) {
+        var m = t.match(pats[i]);
+        if (!m) continue;
+        var n = spCnNum(m[1]);
+        if (n > 0 && n <= 99) { season = n; hit = m[0]; }
+      }
+      var rest = t;
+      if (season && hit) rest = t.replace(hit, " ");
+      // 裸数字放最后：「Reacher 4」「侠探杰克 4」
+      if (!season) {
+        var m2 = t.match(/^(.+?)\s+([0-9]{1,2})$/);
+        if (m2 && String(m2[1]).trim()) { season = Number(m2[2]); rest = m2[1]; }
+      }
+      rest = spUnbracket(rest)
+        .replace(/[\-–—_·・•:：,，、]+/g, " ")
+        .replace(/[（(【\[\s]+$/g, "")
+        .replace(/^[\s）)】\]]+/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!rest) return { title: raw, season: 0 };   // 只输了「第四季」：退回原词
+      return { title: rest, season: season };
+    }
+
+    /** 两个片名是否同一条内容（忽略空格标点全半角） */
+    function spSameTitle(a, b) {
+      var norm = function (x) {
+        return String(x == null ? "" : x).toLowerCase()
+          .replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～·・•]/g, "");
+      };
+      var na = norm(a), nb = norm(b);
+      return !!na && na === nb;
+    }
+
+    /**
+     * 搜索候选（按优先级，已去重）：
+     *   ① 原词             —— 片名自带数字时（海王2 / 蛟龙行动 2）原词才准
+     *   ② 剥掉季数的片名   —— 「侠探杰克 第四季」→「侠探杰克」
+     *   ③ 去标点的版本     —— TMDB 里偶尔存成「Spider-Man」这类带连字符的写法
+     * 每项带 { q, type(raw|stripped), season, title }，打分时用来区分「是谁命中的」。
+     */
+    function searchPlan(wd) {
+      var raw = spCleanQuery(wd);
+      var tag = findSeasonTag(raw);
+      var out = [], seen = {};
+      function push(q, type) {
+        q = spCleanQuery(q);
+        if (!q) return;
+        var k = q.toLowerCase();
+        if (seen[k]) return;
+        seen[k] = 1;
+        out.push({ q: q, type: type, season: tag.season, title: tag.title });
+      }
+      push(raw, "raw");
+      if (tag.season > 0 && !spSameTitle(tag.title, raw)) push(tag.title, "stripped");
+      var strip = /[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～]+/g;
+      var p1 = raw.replace(strip, "");
+      if (p1 && p1 !== raw) push(p1, "raw");
+      if (tag.season > 0) {
+        var p2 = tag.title.replace(strip, "");
+        if (p2 && p2 !== tag.title) push(p2, "stripped");
+      }
+      return out;
+    }
+
+    /**
+     * 相关度打分（越大越靠前）：
+     *   片名相等 +60 / 前缀 +40 / 原文名相等 +40 / 包含 +25
+     *   「剥季片名」命中 +15（原词命中往往是无关条目）
+     *   指定季：真有这一季 +30，明确没这季 -20
+     *   热度（0~12 分，封顶）+ 年份新近度（0~10 分）：同名多部（1999/2023 海贼王）靠这两个分开
+     * item: { name, original, year, popularity, hasType?, hasYear?, seasons?（季号数组，未知就不传） }
+     */
+    function scoreCandidate(item, meta) {
+      var want = String((meta && meta.title) || "").trim();
+      var name = String((item && item.name) || "").trim();
+      var orig = String((item && item.original) || "").trim();
+      var sc = 0;
+      if (want) {
+        if (spSameTitle(name, want)) sc += 60;
+        else if (name && name.toLowerCase().indexOf(want.toLowerCase()) === 0) sc += 40;
+        else if (orig && orig.toLowerCase() === want.toLowerCase()) sc += 40;
+        else if (spSameTitle(orig, want)) sc += 40;
+        else if (name && (name.indexOf(want) >= 0 || want.indexOf(name) >= 0)) sc += 25;
+      }
+      if (meta && meta.type === "stripped") sc += 15;
+      if (meta && Number(meta.season) > 0 && Array.isArray(item && item.seasons)) {
+        sc += item.seasons.indexOf(Number(meta.season)) >= 0 ? 30 : -20;
+      }
+      // 元数据越完整越可信：TMDB 里存在「无类型、无年份、热度极低」的僵尸条目，
+      // 光靠片名相等（+60）会把它顶到真正的剧集前面（实测「Reacher S4」就踩到了）
+      // 缺类型且缺年份 = 多半是空壳条目，扣 15；缺其中一项只扣 5（正常条目常缺地区/年份）
+      if (item) {
+        if (!item.hasType && !item.hasYear) sc -= 15;
+        else if (!item.hasType || !item.hasYear) sc -= 5;
+      }
+      // 热度（对数，封顶 12）与票数（对数，封顶 25）：
+      //   真剧集动辄上千票（Reacher 4k+、ONE PIECE 100k+），空壳条目 0~几十票 → 自然沉底
+      var pop = Number((item && item.popularity) || 0);
+      if (pop > 0) sc += Math.min(12, Math.log(pop + 1) * 1.8);
+      var votes = Number((item && item.votes) || 0);
+      if (votes > 0) sc += Math.min(25, Math.log(votes + 1) * 3.2);
+      var y = Number(String((item && item.year) || "").slice(0, 4)) || 0;
+      if (y > 1900) sc += Math.max(0, 10 - Math.abs(spNowYear() - y) * 0.5);
+      return sc;
+    }
+
+    /** 按打分降序排序（稳定排序：同分保持上游原顺序） */
+    function spSortByScore(list, meta) {
+      var scored = (list || []).map(function (it, i) { return { it: it, sc: scoreCandidate(it, meta), i: i }; });
+      scored.sort(function (a, b) { return (b.sc - a.sc) || (a.i - b.i); });
+      return scored.map(function (x) { return x.it; });
+    }
+
+    /** 季名 → 季号：「Season 4」「第四季」「S4」都能认（Emby 自定义季名常见这几种） */
+    function spSeasonNumberOf(name) {
+      var t = String(name == null ? "" : name);
+      var m = t.match(/season\s*([0-9]{1,2})/i);
+      if (m) return Number(m[1]);
+      m = t.match(/第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部]/);
+      if (m) return spCnNum(m[1]);
+      m = t.match(/^\s*s\s?([0-9]{1,2})\s*$/i);
+      if (m) return Number(m[1]);
+      return 0;
+    }
+
+    /** 剧集：把「目标季」排到第一组（详情页进来就能看到） */
+    function planSeasonOrder(plans, wantSeason) {
+      var ws = Number(wantSeason) || 0;
+      var arr = Array.isArray(plans) ? plans.slice() : [];
+      if (!ws || arr.length < 2) return arr;
+      var idx = -1;
+      for (var i = 0; i < arr.length; i++) {
+        if (Number(arr[i] && arr[i].s) === ws) { idx = i; break; }
+      }
+      if (idx <= 0) return arr;
+      return [arr[idx]].concat(arr.filter(function (_, k) { return k !== idx; }));
+    }
+
+    /**
+     * 让 tmdbVod 生成的每个条目带上 TMDB 原件。
+     * 为什么不在 tmdbVod 里直接写 tmdbItem：它是在原始压缩包里的一行，
+     * 直接改容易和超长行里的其它代码打架；这里改成「按需包装一次」，幂等且可控。
+     * 用途：搜索排序要 genre_ids / popularity / vote_count 判断谁是正主。
+     */
+    function ensureTmdbItem() {
+      if (globalThis.__lmTioVodWrapped === tmdbVod) return;
+      var orig = tmdbVod;
+      if (orig.__tmdbItemWrapped) { globalThis.__lmTioVodWrapped = tmdbVod; return; }
+      tmdbVod = function (item, kind) {
+        var v = orig(item, kind);
+        if (v && item) { try { v.tmdbItem = item; } catch (e) { } }
+        return v;
+      };
+      tmdbVod.__tmdbItemWrapped = true;
+      globalThis.__lmTioVodWrapped = tmdbVod;
+    }
+
+    /**
+     * 小并发跑 async 任务，结果按原顺序返回。
+     * 用途：拿到一个剧的所有季/集清单后补「季列表」，串行请求会拖慢十几秒。
+     */
+    async function spMapLimit(arr, limit, fn) {
+      arr = Array.isArray(arr) ? arr : [];
+      var out = new Array(arr.length), next = 0, workers = [];
+      var n = Math.max(1, Math.min(limit || 4, arr.length || 1));
+      for (var w = 0; w < n; w++) {
+        workers.push((async function () {
+          while (true) {
+            var i = next++;
+            if (i >= arr.length) return;
+            try { out[i] = await fn(arr[i], i); } catch (e) { out[i] = null; }
+          }
+        })());
+      }
+      await Promise.all(workers);
+      return out;
+    }
+
+    /* 旧版剥季数的实现（保留，供 searchVariants 兜底时对照；新搜索链路不再直接用它） */
+    function __spLegacySearchVariants(wd) {
+      var raw = normWord(wd);
+      var sq = splitSeasonQuery(wd);
+      var out = [];
+      var push = function (x) {
+        x = str(x).replace(/\s+/g, " ").trim();
+        if (x && out.indexOf(x) < 0) out.push(x);
+      };
+      push(raw);
+      push(sq.title);
+      push(raw.replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～]+/g, ""));
+      return out.length ? out : [raw];
+    }
+
+    /**
+     * 搜索候选词（按优先级）：内核见 searchPlan（季数感知版）。
+     * 函数名保持不变 —— search / tmdbSearchList / IMDb 兜底都在调用它，
+     * 改成「原词 + 剥季片名 + 去标点」且剥季规则支持中文习惯（第四季 / S4 / 全角括号）。
+     */
+    function searchVariants(wd) {
+      return searchPlan(wd).map(function (x) { return x.q; });
+    }
+
+    /**
+     * 两个片名是否「同一条内容」：忽略空格、标点、全半角差异。
+     * 用于判定要不要给搜索结果打「第 N 季」标记 —— 只有片名一致才打，
+     * 避免搜「权力的游戏 第八季」时把只有 2 季的《龙族》也标成第 8 季。
+     */
+    function sameTitle(a, b) {
+      var norm = function (x) {
+        return String(x == null ? "" : x).toLowerCase()
+          .replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～·・•]/g, "");
+      };
+      var na = norm(a), nb = norm(b);
+      return !!na && na === nb;
+    }
+
+    /**
+     * 从搜索词里剥离「季数」后缀，返回 { title, season }。
+     * ★ 用户习惯直接搜「侠探杰克 第四季」，但 TMDB / IMDb / Emby 都是按片名索引的，
+     *   整句带上季数会 0 命中（实测 TMDB 搜「侠探杰克 第四季」total_results=0，搜「侠探杰克」有 1 条）。
+     * 支持：第四季 / 第4季 / 第 4 季 / 第四部 / Season 4 / S04 / S4。
+     */
+    function splitSeasonQuery(wd) {
+      var raw = normWord(wd);
+      var t = raw, season = 0, m;
+      m = t.match(/第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部]/);
+      if (m) {
+        var n = cnNum(m[1]);
+        if (n > 0) { season = n; t = t.replace(m[0], " "); }
+      }
+      if (!season) {
+        m = t.match(/(?:^|[\s\-_])(?:season|s)\s*([0-9]{1,2})(?:$|[\s\-_])/i);
+        if (m) {
+          var n2 = Number(m[1]);
+          if (n2 > 0) { season = n2; t = t.replace(m[0], " "); }
+        }
+      }
+      // 末尾裸数字：「侠探杰克 4」「Reacher S4」这类常见手写。
+      // 必须带空格/分隔符，否则「海王2」这种片名本身带数字会被误剥（那种情况靠「原词优先」兜住）。
+      if (!season) {
+        m = t.match(/^(.+?)[\s\-_]+([0-9]{1,2})$/);
+        if (m && str(m[1]).trim()) {
+          var n3 = Number(m[2]);
+          if (n3 > 0) { season = n3; t = str(m[1]); }
+        }
+      }
+      t = t.replace(/\s+/g, " ").trim();
+      // 剥完变空（用户只输了「第四季」）就退回原词，别把查询清空
+      if (!t) t = raw;
+      return { title: t, season: season };
+    }
+
+
+    /**
+     * 关键词 → TMDB 条目（中文优先，返回 {list, total, totalPages}）
+     * ★ 改造要点（原来搜「侠探杰克 第四季」直接搜不到）：
+     *   1. 候选词改成 searchPlan：原词 / 剥季片名 / 去标点，剥季规则支持中文习惯；
+     *   2. 不再「原词有结果就返回」：原词和剥季片名都查一遍，合并后统一打分排序。
+     *      搜「权力的游戏 第八季」时，原词会命中一堆无关条目，剥季后的片名才排得上来；
+     *   3. 打分里「目标季确实存在」加分、同名多部按热度/新近度区分，
+     *      所以「海贼王 第十季」不会把 1999 年老版顶到前面。
+     */
     async function tmdbSearchList(wd, page) {
-      var q = normWord(wd);
+      ensureTmdbItem();
+      var plan = searchPlan(wd);
+      var sq = findSeasonTag(wd);
+      var last = { list: [], total: 0, totalPages: 1 };
+      var merged = [], seen = {}, anyTotal = 0;
+      // 候选个数：带季数时只查「原词 + 剥季片名」两个，没季数就只查原词（不额外拖慢普通搜索）
+      var want = sq.season > 0 ? Math.min(2, plan.length) : 1;
+      for (var vi = 0; vi < plan.length; vi++) {
+        // 有季数时最多查 2 个候选（原词 + 剥季片名），没有就按候选顺序查，够用且不拖慢页面
+        if (vi >= (sq.season > 0 ? 2 : plan.length)) break;
+        // ★ 候选词「并行」查：TMDB 在国内网络单次就要 4 秒+，串行查两个候选 = 8~9 秒，
+        //   客户端早就超时把结果丢了（表现就是「搜索一直转圈 / 空列表」）
+        var results = await Promise.all(plan.slice(0, want).map(function (pl) {
+          return tmdbSearchOne(pl.q, page, sq.season, sq.title).catch(function () { return null; });
+        }));
+        for (var wi = 0; wi < results.length; wi++) {
+          var r = results[wi];
+          if (!r) continue;
+          if (!(r.list && r.list.length)) { if (r.totalPages > (last.totalPages || 1)) last = r; continue; }
+          anyTotal = Math.max(anyTotal, Number(r.total) || 0);
+          for (var k = 0; k < r.list.length; k++) {
+            var v = r.list[k];
+            var key = String(v.vod_id || "");
+            if (!key || seen[key]) continue;
+            seen[key] = 1;
+            var ti = v.tmdbItem || {};
+            merged.push({
+              v: v, name: v.vod_name,
+              original: ti.original_title || ti.original_name || "",
+              year: v.vod_year, hasYear: !!v.vod_year,
+              hasType: Array.isArray(ti.genre_ids) && ti.genre_ids.length > 0,
+              popularity: Number(ti.popularity || 0),
+              votes: Number(ti.vote_count || 0)
+            });
+          }
+        }
+        break;   // 并行查完就结束，不走原来的循环
+        // 调试：AB_DEBUG 打开时打印每个候选的命中数与头部条目
+        if (!r) continue;
+        if (r.list && r.list.length) {
+          anyTotal = Math.max(anyTotal, Number(r.total) || 0);
+          for (var k = 0; k < r.list.length; k++) {
+            var v = r.list[k];
+            var key = String(v.vod_id || "");
+            if (!key || seen[key]) continue;
+            seen[key] = 1;
+            // 打分需要的元数据全部来自 TMDB 原件（tmdbItem）：
+            //   genre_ids 判断「是不是一条正经条目」，vote_count 区分正主与空壳
+            var ti = (v && v.tmdbItem) || {};
+            merged.push({
+              v: v, name: v.vod_name,
+              original: ti.original_title || ti.original_name || "",
+              year: v.vod_year, hasYear: !!v.vod_year,
+              hasType: Array.isArray(ti.genre_ids) && ti.genre_ids.length > 0,
+              popularity: Number(ti.popularity || 0),
+              votes: Number(ti.vote_count || 0)
+            });
+          }
+        } else if (r.totalPages > (last.totalPages || 1)) {
+          last = r;   // 记住分页信息，万一全都 0 命中也能原样返回
+        }
+      }
+      if (!merged.length) return last;
+      // 目标季排前面 + 片名相关度排序（分页信息取命中最多的那个候选）
+      var sortedItems = spSortByScore(merged, { title: sq.title || wd, season: sq.season });
+      var sorted = sortedItems.map(function (x) { return (x && x.v) || x; });
+      return { list: sorted, total: Math.max(anyTotal, sorted.length), totalPages: Math.max(1, Number(last.totalPages) || page) };
+    }
+
+    /** 单次 TMDB 搜索（只查一个查询词） */
+    async function tmdbSearchOne(q, page, wantSeason, showTitle) {
       var seen = Object.create(null), list = [], total = 0, totalPages = 1;
       function take(arr, kind) {
         (arr || []).forEach(function (x) {
@@ -5681,7 +6245,15 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
           if (seen[k]) return;
           seen[k] = 1;
           var v = tmdbVod(x, kind);
-          if (v) list.push({ v: v, src: x });
+          if (v) {
+            // 指定了季：只给「片名与搜索词一致」的剧集打季标并编进 vod_id。
+            // 不能给所有结果都打（搜「权力的游戏 第八季」时，「龙族」只有 2 季，误标会误导）。
+            if (wantSeason > 0 && kind !== "movie" && sameTitle(v.vod_name, showTitle)) {
+              v.vod_id = v.vod_id + ":s" + wantSeason;
+              v.vod_remarks = "第 " + wantSeason + " 季 · " + v.vod_remarks;
+            }
+            list.push({ v: v, src: x });
+          }
         });
       }
       try {
@@ -5752,7 +6324,12 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       // 兜底：IMDb 官方联想（支持中文），再用 Cinemeta 补标题海报
       var list = [];
       try {
-        var cands = await imdbCandidates(normWord(q.wd), null, 12);
+        // 兜底也用同一套候选词（IMDb 联想同样按片名索引），逐个试到有结果
+        var cands = [];
+        var vs3 = searchVariants(q.wd);
+        for (var vi3 = 0; vi3 < vs3.length && !cands.length; vi3++) {
+          try { cands = await imdbCandidates(vs3[vi3], null, 12); } catch (e4) { cands = []; }
+        }
         for (var i = 0; i < cands.length; i++) {
           var kind = cands[i].tv ? "series" : "movie";
           var meta = await cinemetaMeta(cands[i].tv ? "series" : "movie", cands[i].id).catch(function () { return null; });
@@ -5773,8 +6350,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
     /** 解析详情 id：tmdb:movie:123 / tmdb:tv:456（也兼容旧的 movie:tt1234567） */
     function parseVodId(vid) {
       var t = str(vid).trim();
-      var m = t.match(/^tmdb:(movie|tv):(\d+)$/);
-      if (m) return { source: "tmdb", kind: m[1], tmdbId: Number(m[2]) };
+      var m = t.match(/^tmdb:(movie|tv):(\d+)(?::s(\d+))?$/);
+      if (m) return { source: "tmdb", kind: m[1], tmdbId: Number(m[2]), season: Number(m[3]) || 0 };
       m = t.match(/^(movie|series):(tt\d{7,9})$/);
       if (m) return { source: "imdb", kind: m[1] === "series" ? "tv" : "movie", imdb: m[2] };
       m = t.match(/^(tt\d{7,9})$/);
@@ -5783,6 +6360,18 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
     }
 
     /** TMDB 条目 → IMDb ID（Torrentio 只认 IMDb） */
+    /** IMDb → TMDB id（剧集）。TMDB 官方 find 接口，一次请求即可 */
+    async function tmdbIdOfImdb(imdb) {
+      var id = str(imdb);
+      if (!/^tt\d{5,10}$/.test(id)) return 0;
+      try {
+        var d = await tmdbGet("/find/" + id, { external_source: "imdb_id" });
+        var tv = (d && Array.isArray(d.tv_results)) ? d.tv_results[0] : null;
+        if (tv && tv.id) return Number(tv.id);
+      } catch (e) { }
+      return 0;
+    }
+
     async function imdbOfTmdb(tmdbId, kind) {
       try {
         var ext = await tmdbGet("/" + kind + "/" + tmdbId + "/external_ids");
@@ -5844,48 +6433,25 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
         if (!vod) vod = { vod_id: str(ids[i]), vod_name: str(ids[i]), vod_pic: "", vod_remarks: "Torrentio" };
         vod.vod_play_from = "Torrentio";
 
-        // 剧集：整理每季集列表（优先 TMDB，退回 Cinemeta）
-        var episodesBySeason = null;
+        // 剧集：整理「每一季 + 该季全部分集」，供详情页按季出线路组（与 Emby 一致）
+        var seasonPlans = null;
         if (kind === "tv") {
-          if (info.source === "tmdb") {
-            try {
-              var td = await tmdbGet("/tv/" + info.tmdbId);
-              var seasons = (td.seasons || []).filter(function (s) { return Number(s.season_number) > 0; });
-              // 只取第一个正季做「按画质」线路组，避免一次请求几十季
-              if (seasons.length) {
-                var first = seasons[0];
-                episodesBySeason = { "1": await tmdbEpisodes(info.tmdbId, Number(first.season_number)) };
-              }
-            } catch (e) { warn("TMDB 剧集清单失败：" + ((e && e.message) || e)); }
-          }
-          if (!episodesBySeason) {
-            var cmeta = await cinemetaMeta("series", imdb);
-            var vs = (cmeta && Array.isArray(cmeta.videos)) ? cmeta.videos : [];
-            var seasonsMap = {};
-            vs.forEach(function (v) {
-              var sn = v.season === undefined || v.season === null ? 1 : Number(v.season);
-              var en = Number(v.number || v.episode) || 0;
-              if (sn <= 0 || !en) return;
-              (seasonsMap[sn] = seasonsMap[sn] || []).push({ s: sn, e: en, name: str(v.name || "").trim() });
-            });
-            var ks = Object.keys(seasonsMap).map(Number).sort(function (a, b) { return a - b; });
-            episodesBySeason = ks.length ? (function () { var o = {}; o[String(ks[0])] = seasonsMap[ks[0]]; return o; })() : null;
-          }
+          seasonPlans = await buildSeasonPlans(info, imdb);
+          // 搜索时带了季数（如「侠探杰克 第四季」）：把这一季排到第一组，进来就能看到。
+          // 统一走 planSeasonOrder：季号（s）对不上时还能按季名（Season 4 / 第四季）兜底匹配
+          seasonPlans = planSeasonOrder(seasonPlans, info.season);
         }
 
         if (cfg.enable !== false && imdb) {
           try {
-            var epsList = null, seasonNo = 0;
-            if (episodesBySeason) {
-              seasonNo = Number(Object.keys(episodesBySeason)[0]);
-              epsList = episodesBySeason[String(seasonNo)] || [];
-            }
+            var firstPlan = (seasonPlans && seasonPlans[0]) || null;
             var lists = await buildPlayLists({
               kind: kind === "tv" ? "series" : "movie",
               imdb: imdb,
-              season: seasonNo || 0,
-              episode: epsList && epsList.length ? epsList[0].e : 0,
-              episodes: epsList || []
+              season: firstPlan ? firstPlan.s : 0,
+              episode: firstPlan && firstPlan.episodes.length ? firstPlan.episodes[0].e : 0,
+              seasons: seasonPlans || [],
+              preferSeason: info.season || 0
             });
             if (lists.groups && lists.groups.length) {
               vod.vod_play_url = lists.groups.join("$$$");
@@ -5902,6 +6468,87 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       return { list: out };
     }
 
+    /**
+     * 合并多来源的季/集清单：同一季取「集号并集」，分集名取先出现的非空值。
+     * 两个来源各有短板（TMDB 有完整季但分集名要靠逐季请求；Cinemeta 有分集名但偶尔缺季），
+     * 取并集比「谁先谁赢」稳。
+     */
+    function mergeSeasonPlans(sources) {
+      var map = {};
+      (sources || []).forEach(function (plans) {
+        (plans || []).forEach(function (p) {
+          var sn = Number(p && p.s);
+          if (!(sn > 0)) return;
+          var cur = map[sn] || (map[sn] = { s: sn, name: "", eps: {} });
+          if (!cur.name && str(p.name)) cur.name = str(p.name);
+          (p.episodes || []).forEach(function (e) {
+            var en = Number(e && e.e);
+            if (!en) return;
+            var old = cur.eps[en];
+            if (!old) cur.eps[en] = { s: sn, e: en, name: str(e.name) };
+            else if (!old.name && str(e.name)) old.name = str(e.name);
+          });
+        });
+      });
+      return Object.keys(map).map(Number).sort(function (a, b) { return a - b; }).map(function (sn) {
+        var cur = map[sn];
+        var eps = Object.keys(cur.eps).map(Number).sort(function (a, b) { return a - b; }).map(function (k) { return cur.eps[k]; });
+        return { s: sn, name: cur.name || ("第 " + sn + " 季"), episodes: eps };
+      }).filter(function (p) { return p.episodes.length > 0; });
+    }
+
+    /** TMDB → 季骨架（只请求 /tv/{id}，用 episode_count 铺集号，不逐季请求） */
+    async function tmdbSeasonPlans(tmdbId) {
+      var id = Number(tmdbId) || 0;
+      if (!id) return [];
+      try {
+        var td = await tmdbGet("/tv/" + id);
+        var list = (td && Array.isArray(td.seasons) ? td.seasons : []).filter(function (s) {
+          return Number(s.season_number) > 0 && Number(s.episode_count) > 0;
+        });
+        return list.map(function (s) {
+          var sn = Number(s.season_number);
+          var eps = [];
+          for (var e = 1; e <= Number(s.episode_count); e++) eps.push({ s: sn, e: e, name: "" });
+          return { s: sn, name: str(s.name), episodes: eps };
+        }).sort(function (a, b) { return a.s - b.s; });
+      } catch (e) {
+        warn("TMDB 季列表失败：" + ((e && e.message) || e));
+        return [];
+      }
+    }
+
+    /** Cinemeta → 季清单（含分集名，通常已覆盖全部季） */
+    async function cinemetaSeasonPlans(imdb) {
+      if (!/^tt\d{5,10}$/.test(str(imdb))) return [];
+      var cmeta = await cinemetaMeta("series", imdb);
+      var vs = (cmeta && Array.isArray(cmeta.videos)) ? cmeta.videos : [];
+      var map = {};
+      vs.forEach(function (v) {
+        var sn = v.season === undefined || v.season === null ? 1 : Number(v.season);
+        var en = Number(v.number || v.episode) || 0;
+        if (!(sn > 0) || !en) return;
+        // 字段名必须是 episodes：mergeSeasonPlans 按这个名字读
+        (map[sn] = map[sn] || { s: sn, name: "", episodes: [] });
+        map[sn].episodes.push({ s: sn, e: en, name: str(v.name || "").trim() });
+      });
+      return Object.keys(map).map(Number).sort(function (a, b) { return a - b; }).map(function (sn) { return map[sn]; });
+    }
+
+    /**
+     * 整理剧集的「每一季 + 该季全部分集」。
+     * ★ 修复：旧实现只取第一季（TMDB 只请求第一个正季，Cinemeta 也只取 ks[0]），
+     *   多季剧在详情页只能看到一季（例如《侦探杰克》）。
+     * 现在 TMDB（全季骨架）与 Cinemeta（含分集名）取并集，任一来源缺季都能补齐。
+     * 第 0 季是花絮/特别篇，和 Emby 的处理一致，一律丢弃。
+     */
+    async function buildSeasonPlans(info, imdb) {
+      var tid = (info && info.tmdbId) || 0;
+      if (!tid && /^tt\d{5,10}$/.test(str(imdb))) tid = await tmdbIdOfImdb(str(imdb));
+      var tmdbPlans = await tmdbSeasonPlans(tid);
+      var ciPlans = await cinemetaSeasonPlans(imdb);
+      return mergeSeasonPlans([tmdbPlans, ciPlans]);
+    }
     // ---------------------------------------------------------------- 磁力核心
     function torrentCore() {
       try { return globalThis.lmTorrentReady ? globalThis.lmTorrentReady() : null; } catch (e) { warn("磁力核心不可用：" + (e && e.message)); return null; }
@@ -5980,7 +6627,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       var core = torrentCore();
       if (!core) return { code: 1, url: "", message: "引擎磁力核心未就绪（需在支持 WebTorrent 的引擎上运行）" };
       if (!slot.magnet) return { code: 1, url: "", message: "缺少磁力链接" };
-      var timeout = num(cfg.metadataTimeout, 45000);
+      // slot.timeout 由「播放页多画质解析」传入，比单条起播更短，避免播放页长时间转圈
+      var timeout = num(slot.timeout, num(cfg.metadataTimeout, 45000));
       var sum;
       try {
         sum = await core.resolve(slot.magnet, { timeout: timeout });
@@ -6027,6 +6675,101 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
     /** 引擎的 /play 磁力钩子用的 token：magnet 的 base64url，可直接丢给 /torrent/stream?d= */
     function magnetToken(magnet) { return Buffer.from(str(magnet), "utf8").toString("base64url"); }
 
+    /**
+     * 播放页画质分档（比详情页的 qualityTier 宽）：4K / 1080P / 720P / 其他。
+     * 详情页只留 4K、1080P 是为了线路组别太长；播放页是用户主动挑画质，四档都给出更实用。
+     */
+    function seriesTierLabel(q, name) {
+      var t = (str(q) + " " + str(name)).toLowerCase();
+      if (/\b4k\b|2160|\buhd\b/.test(t)) return { label: "4K", rank: 4 };
+      if (/1080/.test(t)) return { label: "1080P", rank: 3 };
+      if (/720/.test(t)) return { label: "720P", rank: 2 };
+      return { label: "其他", rank: 1 };
+    }
+
+    /**
+     * 剧集多画质：把这一集按画质分档，每档挑「最可能可用」的一条，并发解析成本机可播地址，
+     * 拼成播放页的「画质」数组（平铺「名称, 地址, 名称, 地址 …」）。
+     * 返回 null 表示拿不到两条以上，交给调用方走原来的单选逻辑兜底。
+     *
+     * 取舍说明：
+     *   · 每档只取一条 —— 播放页画质菜单应当短而准，不是资源列表；
+     *   · 并发数受 mqParallel 限制（默认 3），因为每条磁力都要在 WebTorrent 里解析 metadata；
+     *   · 解析超时用 mqTimeout（默认 18 秒），比单条起播的 metadataTimeout 短，避免播放页长时间转圈。
+     */
+    async function seriesQualityPlay(req, decoded, preferTier) {
+      var got = await fetchStreams({ kind: "series", imdb: decoded.imdb, season: decoded.season, episode: decoded.episode });
+      if (!got || !Array.isArray(got.streams) || !got.streams.length) return null;
+      var buckets = {};
+      got.streams.forEach(function (st) {
+        if (!st.magnet && !st.url) return;
+        var tier = seriesTierLabel(st.info.quality, st.info.name + " " + st.info.filename);
+        (buckets[tier.label] = buckets[tier.label] || []).push({ st: st, rank: tier.rank });
+      });
+      var order = ["4K", "1080P", "720P", "其他"];
+      var picks = [];
+      order.forEach(function (lb) {
+        var arr = buckets[lb];
+        if (!arr || !arr.length) return;
+        arr.sort(function (a, b) {
+          // 单集种子优先于整季包（整季包要下载大文件，起播慢），再看做种数
+          var pa = a.st.info.isPack ? 1 : 0, pb = b.st.info.isPack ? 1 : 0;
+          if (pa !== pb) return pa - pb;
+          return (b.st.info.seeders || 0) - (a.st.info.seeders || 0);
+        });
+        picks.push({ label: lb, st: arr[0].st, rank: arr[0].rank });
+      });
+      if (!picks.length) return null;
+      // 旧详情页缓存下来的线路 id 会带 tier：把用户当时挑的那档提到最前
+      if (preferTier) {
+        var first = picks.filter(function (x) { return x.label === preferTier; });
+        if (first.length) picks = first.concat(picks.filter(function (x) { return x.label !== preferTier; }));
+      }
+      var parallel = Math.min(num(cfg.mqParallel, 3), picks.length);
+      var top = picks.slice(0, parallel);
+      var timeout = num(cfg.mqTimeout, 18000);
+      var resolved = await Promise.all(top.map(function (p) {
+        return (async function () {
+          var st = p.st;
+          var r = st.magnet
+            ? await magnetPlay(req, Object.assign({
+                kind: "series", season: decoded.season, episode: decoded.episode,
+                seeders: st.info.seeders, timeout: timeout
+              }, st))
+            : await debridPlay(req, st);
+          if (!r || r.code !== 0 || !r.url) return { label: p.label, st: st, err: (r && r.message) || "" };
+          return { label: p.label, st: st, url: r.url, extra: r.extra || {} };
+        })().catch(function (e) { return { label: p.label, st: p.st, err: (e && e.message) || String(e) }; });
+      }));
+      var ok = resolved.filter(function (x) { return !!x.url; });
+      if (!ok.length) return null;
+      // 只有一条能播：退回单链（播放器就不会显示一个只有「原画」的画质菜单）
+      if (ok.length === 1) {
+        var one = ok[0];
+        return { code: 0, url: one.url, parse: 0, header: {}, extra: one.extra };
+      }
+      var arr = [], usedLabel = {};
+      ok.forEach(function (x) {
+        // 画质描述带上杜比视界 / HDR / 编码 / 音轨，方便在播放页直接判断值不值得切
+        var head = qualityLabelOf(x.label, x.st.info);
+        var bits = [head];
+        if (x.st.info.sizeText) bits.push(x.st.info.sizeText);
+        if (x.st.info.seeders != null) bits.push("\uD83D\uDC64" + x.st.info.seeders);
+        if (x.st.info.provider) bits.push(x.st.info.provider);
+        var base = bits.join(" \u00B7 ").replace(/[$#]/g, " ").replace(/\s+/g, " ").trim() || x.label;
+        var label = base, dup = 2;
+        while (usedLabel[label]) label = base + " #" + dup++;
+        usedLabel[label] = 1;
+        arr.push(label, x.url);
+      });
+      var failed = resolved.filter(function (x) { return !x.url; }).map(function (x) { return x.label; });
+      log("剧集多画质 " + decoded.imdb + " S" + decoded.season + "E" + decoded.episode + " → " + (arr.length / 2) + " 档：" +
+        arr.filter(function (x, i) { return i % 2 === 0; }).join(" / ") + (failed.length ? "（失败：" + failed.join("/") + "）" : ""));
+      var extra2 = Object.assign({}, ok[0].extra || {});
+      extra2.message = "Torrentio 共 " + (arr.length / 2) + " 个画质，可在播放页切换" + (failed.length ? "（" + failed.join("/") + " 解析失败）" : "");
+      return { code: 0, url: arr, urls: arr, parse: 0, header: {}, extra: extra2 };
+    }
+
     // ---------------------------------------------------------------- 播放
     async function play(req) {
       await loadConfig(req && req.server && req.server.db);
@@ -6051,6 +6794,15 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
       // 直接从详情页起播：先拉一次资源列表，取第一条能用的
       if (decoded) {
         if (!/^tt\d{7,9}$/.test(decoded.imdb)) return { code: 1, url: "", message: "IMDb ID 无效" };
+        // 剧集：先在播放页给出「多画质」线路（电影仍在详情页按画质分组，这里不动）
+        if (decoded.kind === "series") {
+          try {
+            var mq = await seriesQualityPlay(req, decoded, str(decoded.tier));
+            if (mq) return mq;
+          } catch (e) {
+            warn("剧集多画质解析失败，退回单链：" + ((e && e.message) || e));
+          }
+        }
         var got = await fetchStreams(decoded);
         if (!got.streams.length) return { code: 1, url: "", message: got.errorText || "Torrentio 没有返回资源" };
         var tried = 0, lastErr = null;
@@ -6186,7 +6938,9 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
               fileIdx: st.fileIdx, quality: st.info.quality, size: st.info.sizeText, seeders: st.info.seeders,
               tier: label
             });
-            var nm = [label, st.info.sizeText, st.info.seeders != null ? "👤" + st.info.seeders : "", st.info.provider].filter(Boolean).join(" · ");
+            // 线路名带详细画质（杜比视界 / HDR / 编码 / 音轨）+ 体积 / 做种 / 片源站
+            var head = qualityLabelOf(label, st.info);
+            var nm = [head, st.info.sizeText, st.info.seeders != null ? "\uD83D\uDC64" + st.info.seeders : "", st.info.provider].filter(Boolean).join(" \u00B7 ");
             return nm + "$" + routeId(payload);
           });
           mvGroups.push(items.join("#"));
@@ -6201,113 +6955,45 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
         return { froms: mvFroms, groups: mvGroups, count: got.streams.length, errorText: got.errorText, skipped: describeSkipped(got.skipped) };
       }
 
-      // ---------- 剧集 ----------
-      var episodes = (decoded.episodes || []).slice();
-      // 当前选中集排第一：这样用户在详情页点「播放」时，第一集一定已经有数据
-      episodes.sort(function (a, b) {
-        var ca = (a.s === decoded.season && a.e === decoded.episode) ? 0 : 1;
-        var cb = (b.s === decoded.season && b.e === decoded.episode) ? 0 : 1;
-        return ca - cb || a.e - b.e;
-      });
-      if (!episodes.length) {
+      // ---------- 剧集：按季出一组线路（和 Emby 一致：一季一组，组内是该季全部集）----------
+      //   · 季数选择交给详情页的线路组切换（客户端一次只显示一组，正好用来做「选季」）；
+      //   · 画质不在这里展开，起播时才按画质解析，所以不需要为每集提前请求 Torrentio；
+      //   · decoded.seasons 由 buildSeasonPlans() 提供（TMDB 全季 或 Cinemeta 全季）。
+      var seasons = Array.isArray(decoded.seasons) ? decoded.seasons.slice() : [];
+      // 兼容旧调用：只给了单季的 episodes
+      if (!seasons.length && Array.isArray(decoded.episodes) && decoded.episodes.length) {
+        seasons = [{ s: decoded.season || 1, name: "", episodes: decoded.episodes }];
+      }
+      if (!seasons.length) {
         return { froms: ["Torrentio"], groups: ["自动选源(推荐)$" + autoId], count: 0 };
       }
-      // ★ Torrentio 的剧集接口是「按季:集」返回的：每条流本身就是那一集的种子
-      //   （filename 里带 S01E02）。所以必须逐集取流，不能拿一次结果套到所有集上。
-      //   单集请求实测 5~30 秒 → 详情页先「用已缓存的数据立刻出结果」，
-      //   缺的集在后台补齐（并发 6 路），用户停留几秒后再次进入就能看到全部画质。
-      var detail = {};
-      for (var ei = 0; ei < episodes.length; ei++) {
-        var epk = episodes[ei].s + ":" + episodes[ei].e;
-        var cached = streamCache.get(streamCacheKey({ kind: "series", imdb: decoded.imdb, season: episodes[ei].s, episode: episodes[ei].e }));
-        if (cached) detail[epk] = (cached.value && cached.value.streams) || [];
-      }
-      // 后台补齐（不阻塞详情返回）
-      var pending = episodes.filter(function (ep) { return !detail[ep.s + ":" + ep.e]; });
-      var bgQueue = pending.slice();
-      var bgWorker = async function () {
-        while (bgQueue.length) {
-          var ep2 = bgQueue.shift();
-          try { await fetchStreams({ kind: "series", imdb: decoded.imdb, season: ep2.s, episode: ep2.e }); } catch (e) { }
+      // 指定季优先（搜索「某某 第四季」进来时，第 4 季排第一组），其余按季号升序
+      var preferS = Number(decoded.preferSeason) || 0;
+      seasons.sort(function (a, b) {
+        var sa = Number(a.s) || 0, sb = Number(b.s) || 0;
+        if (preferS) {
+          var pa = sa === preferS ? 0 : 1, pb = sb === preferS ? 0 : 1;
+          if (pa !== pb) return pa - pb;
         }
-      };
-      var bgAll = null;
-      if (pending.length) {
-        var runners = [];
-        for (var wi0 = 0; wi0 < 10; wi0++) runners.push(bgWorker());
-        bgAll = Promise.all(runners);
-      }
-      // 关键取舍：详情页最多等 4 秒。等到了几集就先把它们按画质出线路；
-      // 一集都没等到，就只给「按起播」，剩下的补完后下次进入（或点播时）自然就有画质可选。
-      if (bgAll && !Object.keys(detail).length) {
-        await Promise.race([bgAll, new Promise(function (rs) { setTimeout(rs, 3500); })]);
-        // 后台 worker 直接写的是 streamCache，这里要把已完成的再读回 detail
-        for (var ri = 0; ri < episodes.length; ri++) {
-          var rk = episodes[ri].s + ":" + episodes[ri].e;
-          if (detail[rk]) continue;
-          var rc = streamCache.get(streamCacheKey({ kind: "series", imdb: decoded.imdb, season: episodes[ri].s, episode: episodes[ri].e }));
-          if (rc) detail[rk] = (rc.value && rc.value.streams) || [];
-        }
-      }
-
-      // 按画质归档：{ label: { "s:e": [stream...] } }
-      var tiers = {};
-      episodes.forEach(function (ep) {
-        (detail[ep.s + ":" + ep.e] || []).forEach(function (st) {
-          var tier = qualityTier(st.info.quality, st.info.name + " " + st.info.filename);
-          if (!tier) return;
-          var label = tier.label;
-          if (!tiers[label]) tiers[label] = { label: label, rank: tier.rank, map: {}, count: 0 };
-          var key = ep.s + ":" + ep.e;
-          (tiers[label].map[key] = tiers[label].map[key] || []).push(st);
-          tiers[label].count++;
-        });
+        return sa - sb;
       });
-      var tierList = Object.keys(tiers).filter(function (k) { return k === "4K" || k === "1080P"; })
-        .map(function (k) { return tiers[k]; })
-        .sort(function (a, b) { return b.rank - a.rank || b.count - a.count; });
-      // 一个画质都还没缓存下来时，至少给出「按起播」，让用户先能选集
-
-
-      if (!tierList.length) return { froms: ["Torrentio"], groups: ["自动选源(推荐)$" + autoId], count: 0 };
-      var groups = [], froms = [];
-      tierList.forEach(function (t) {
-        var items = [];
-        episodes.forEach(function (ep) {
-          var key = ep.s + ":" + ep.e;
-          var arr = t.map[key] || [];
-          if (!arr.length) return;
-          // 同一集同一画质可能有多条：按做种数挑最好的那条
-          arr.sort(function (a, b) { return (b.info.seeders || 0) - (a.info.seeders || 0); });
-          var cand = arr[0];
-          var payload = Object.assign({}, base, {
-            season: ep.s, episode: ep.e,
-            magnet: cand.magnet || "", url: cand.url || "",
-            fileIdx: cand.fileIdx, quality: cand.info.quality, size: cand.info.sizeText, seeders: cand.info.seeders,
-            pack: cand.info.isPack || false, tier: t.label
-          });
-          // 和电影线路一样带上体积 / 做种数，方便判断哪一集值得点
-          var epTag = "S" + (ep.s < 10 ? "0" : "") + ep.s + "E" + (ep.e < 10 ? "0" : "") + ep.e;
-          var info2 = [];
-          if (cand.info.sizeText) info2.push(cand.info.sizeText);
-          if (cand.info.seeders !== null && cand.info.seeders !== undefined) info2.push("\uD83D\uDC64" + cand.info.seeders);
-          if (cand.info.isPack) info2.push("整季包");
-          var epName = epTag + (info2.length ? " · " + info2.join(" · ") : "") + (ep.name ? " " + ep.name : "");
-          items.push(epName + "$" + routeId(payload));
+      var seasonGroups = [], seasonFroms = [], epTotal = 0;
+      seasons.forEach(function (sea) {
+        var eps = (sea.episodes || []).slice().sort(function (a, b) { return (Number(a.e) || 0) - (Number(b.e) || 0); });
+        if (!eps.length) return;
+        var lines = eps.map(function (ep) {
+          var nm = str(ep.name).replace(/[$#]/g, " ").trim();
+          return ("第" + ep.e + "集" + (nm ? " " + nm.slice(0, 20) : "")) + "$" + ["series", decoded.imdb, ep.s, ep.e].join("|");
         });
-        if (!items.length) return;
-        groups.push(items.join("#"));
-        froms.push(t.label + "(" + items.length + "集)");
+        seasonGroups.push(lines.join("#"));
+        var sn = Number(sea.s) || 1;
+        seasonFroms.push(str(sea.name) || ("第 " + sn + " 季"));
+        epTotal += lines.length;
       });
-      if (!groups.length) return { froms: ["Torrentio"], groups: ["自动选源(推荐)$" + autoId], count: 0 };
-
-      // 最后一组：不选画质，直接按集起播
-      var byEp = ["自动选源(推荐)$" + autoId].concat(episodes.map(function (ep) {
-        return ("第" + ep.e + "集" + (ep.name ? " " + ep.name : "")) + "$" + ["series", decoded.imdb, ep.s, ep.e].join("|");
-      })).join("#");
-      groups.push(byEp);
-      froms.push("按起播");
-      return { froms: froms, groups: groups, count: groups.length };
+      if (!seasonGroups.length) {
+        return { froms: ["Torrentio"], groups: ["自动选源(推荐)$" + autoId], count: 0 };
+      }
+      return { froms: seasonFroms, groups: seasonGroups, count: epTotal };
     }
 
 
@@ -6326,6 +7012,14 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
         var c = readJson(await httpGetFollow(cfg.cinemeta + "/catalog/movie/top/skip=0.json", { timeout: 20000 }), "Cinemeta");
         push("Cinemeta 可达", Array.isArray(c.metas) && c.metas.length > 0, "返回 " + ((c.metas || []).length) + " 条");
       } catch (e) { push("Cinemeta 可达", false, (e && e.message) || String(e)); }
+      // 2.5) 站内搜索自测：搜「片名 + 季数」这条链路通不通（诊断用）
+      try {
+        var t1 = Date.now();
+        var sr = await search({ body: { wd: "侠探杰克 第四季", page: 1 } });
+        var sl = (sr && sr.list) || [];
+        push("站内搜索 侠探杰克 第四季", sl.length > 0,
+          sl.length + " 条 / " + (Date.now() - t1) + "ms" + (sl.length ? " · 首条 " + sl[0].vod_name + "(" + sl[0].vod_id + ")" : " · msg=" + ((sr && sr.msg) || "无")));
+      } catch (e) { push("站内搜索 侠探杰克 第四季", false, (e && e.message) || String(e)); }
       // 3) 配置路径拼装（把当前配置的路径段回显，便于核对）
       var path = buildConfigPath();
       push("配置路径拼装", true, path ? "/" + path : "（默认，无筛选）");
@@ -6440,7 +7134,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
               { k: "providers", label: "启用的片源站", type: "text", ph: "留空=全部（如 yts,1337x,thepiratebay）" },
               { k: "sort", label: "排序方式", type: "select", options: [["画质优先，再看做种数（默认）", "quality"], ["画质优先，再按体积", "qualitysize"], ["做种数优先", "seeders"], ["体积优先", "size"]] },
               { k: "language", label: "优先语种", type: "select", options: [["不优先（默认）", ""], ["中文", "chinese"], ["繁中", "taiwanese"], ["日语", "japanese"], ["韩语", "korean"], ["英语", "english"], ["印地语", "hindi"], ["多音轨", "multi audio"], ["双语", "dual audio"]] },
-              { k: "excludeQuality", label: "排除画质", type: "text", ph: "如 cam,scr", note: "可选：brremux,hdrall,dolbyvision,4k,1080p,720p,480p,scr,cam" },
+              { k: "excludeQuality", label: "排除画质", type: "text", ph: "如 cam,scr 或 2160p,DV", note: "填要排除的档位，逗号分隔。支持常见写法：2160p/4K/UHD、1080p、720p、480p、DV/DolbyVision、HDR、Remux、cam、scr、other。服务端与此处各筛一次" },
               { k: "limit", label: "每种画质最多返回几条", type: "text", ph: "留空=不限制（1-999）" },
               { k: "sizeFilter", label: "服务端体积上限", type: "text", ph: "如 20GB；剧集可写 3GB,50GB（单集,整季）" },
               { k: "debridKey", label: "Debrid 密钥（可选）", type: "password", ph: "密钥|提供商，如 xxxx|alldebrid", note: "填了以后 Debrid 已缓存的种子会给出秒开直链" },
@@ -6589,7 +7283,22 @@ if (typeof module !== "undefined" && module.exports) module.exports = lmTorrentC
           POST("/category", category);
           POST("/detail", detail);
           POST("/play", play);
-          POST("/search", search);
+          // 诊断：搜「片名+季数」出问题时，这一行能看出请求体、候选词和最终命中数
+          router.post("/search", async function (req, reply) {
+            var t0 = Date.now();
+            try {
+              var body = (req && req.body) || {};
+              var plan = searchPlan(body.wd || body.keyword || body.k || body.q || "");
+              var r = await search(req, reply);
+              log("[season] " + KEY + " body=" + JSON.stringify(body).slice(0, 160) +
+                " → 候选=[" + plan.map(function (x) { return x.q + "/" + x.type; }).join(", ") + "]" +
+                " → 命中 " + ((r && r.list && r.list.length) || 0) + " 条 (" + (Date.now() - t0) + "ms)");
+              return r;
+            } catch (e) {
+              log("[season] " + KEY + " 搜索异常：" + ((e && e.stack) || (e && e.message) || e));
+              return { page: 1, pagecount: 1, limit: 0, total: 0, list: [], msg: "搜索异常：" + ((e && e.message) || e) };
+            }
+          });
         },
         check: async function () { return cfg.enable !== false; },
         // 浏览器直接打开 /website/torrentio 能看到的自检页
@@ -6720,8 +7429,12 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       var out = Object.assign({}, cfg);
       out.torboxKeyConfigured = !!str(cfg.torboxKey);
       out.torboxKey = str(cfg.torboxKey) ? "****" : "";
-      out.manifestUrlEffective = manifestUrl();
-      out.manifestFromParams = !bool(cfg.useManifestUrl, true);
+      var eff = manifestUrl();
+      out.manifestUrlEffective = eff;
+      // 实际是否用了「站点域名 + 参数」现拼（手填了非默认地址时才算手动）
+      var manual = str(cfg.manifestUrl);
+      out.manifestFromParams = !(bool(cfg.useManifestUrl, true) && manual && manual !== DEFAULT_CONFIG.manifestUrl);
+      out.qualityWhitelist = Object.keys(qualityWhitelist() || {}).length ? Object.keys(qualityWhitelist()) : ["全部"];
       return out;
     }
 
@@ -6788,24 +7501,40 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       try { return Buffer.from(String(text), "base64url").toString("utf8"); } catch (e) { return ""; }
     }
 
-    /** 按 HdHub 官方配置页的字段拼 base64 配置段 */
+    /**
+     * 按 HdHub 官方配置页的字段拼 base64 配置段。
+     * ★ 只在「用户改过」时才写入对应字段：catalogs / mq / mp 的默认值与插件默认行为不同，
+     *   无条件写进去会悄悄改变目录范围与每种画质的条数。这样保持默认段与内置地址等价。
+     */
     function buildConfigSegment() {
       var conf = {};
       conf.torbox = str(cfg.torboxKey) || "unset";
       if (bool(cfg.tbOnly, false)) conf.tb_only = "true";
       if (bool(cfg.tbUsenet, false)) conf.tb_usenet = "true";
       var cats = str(cfg.catalogs).split(/[,\s]+/).filter(Boolean);
-      if (cats.length) conf.catalogs = cats.join(",");
+      if (cats.length && cats.join(",") !== str(DEFAULT_CONFIG.catalogs)) conf.catalogs = cats.join(",");
       if (str(cfg.content)) conf.content = str(cfg.content);
+      // qualities 总是写入：这是用户最常调的筛选，写出来才能确保按配置生效
       if (str(cfg.qualities)) conf.qualities = str(cfg.qualities);
       if (str(cfg.sort)) conf.sort = str(cfg.sort);
-      if (str(cfg.maxPerQuality)) conf.mq = str(cfg.maxPerQuality);
+      if (str(cfg.maxPerQuality) && str(cfg.maxPerQuality) !== str(DEFAULT_CONFIG.maxPerQuality)) conf.mq = str(cfg.maxPerQuality);
       if (str(cfg.maxPerProvider)) conf.mp = str(cfg.maxPerProvider);
       return Buffer.from(JSON.stringify(conf), "utf8").toString("base64url").replace(/=+$/, "");
     }
 
+    /**
+     * 最终 manifest 地址。
+     * ★ 关键修复：以前只要 useManifestUrl=true（默认）就直接用 manifestUrl 字段，
+     *   而该字段的默认值里硬编码了 qualities=2160p,1080p,720p，导致配置页里改「画质档位」
+     *   等参数完全不生效（看起来就是「画质筛选没用」）。
+     *   现在的规则：
+     *     · 用户手动填了与内置默认不同的地址 → 尊重手填地址（仍然手动优先）
+     *     · 否则一律用「站点域名 + 参数」现拼，保证配置页改了就生效
+     */
     function manifestUrl() {
-      if (bool(cfg.useManifestUrl, true) && str(cfg.manifestUrl)) return str(cfg.manifestUrl);
+      var manual = str(cfg.manifestUrl);
+      var isBuiltin = !manual || manual === DEFAULT_CONFIG.manifestUrl;
+      if (bool(cfg.useManifestUrl, true) && manual && !isBuiltin) return manual;
       var host = str(cfg.host || "hdhub.thevolecitor.qzz.io").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
       return "https://" + host + "/" + buildConfigSegment() + "/manifest.json";
     }
@@ -7072,6 +7801,54 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       return m ? m[1] : "";
     }
 
+    /**
+     * 画质细节标记：从流的 name / description / filename 里抽「杜比视界 / HDR / 色深 / 编码 / 音轨」。
+     * HdHub 的描述行常写成「2160p [HubCloud] 8.4 GB」，编码与 HDR 信息多藏在背后的文件名或 name 里，
+     * 所以三处一起扫；顺序固定（动态范围 → 色深 → 视频编码 → 音频编码），便于横向比较。
+     */
+    function hdQualityTags(text) {
+      var t = str(text);
+      if (!t) return [];
+      var out = [];
+      if (/dolby[\s._-]*vision|\bdv\b|杜比视界/i.test(t)) out.push("杜比视界");
+      if (/hdr10\+|hdr10p|hdr\s*10\s*\+/i.test(t)) out.push("HDR10+");
+      else if (/\bhdr\b|hdr10|杜比视界|dolby[\s._-]*vision/i.test(t)) out.push("HDR");
+      if (/\bhlg\b/i.test(t)) out.push("HLG");
+      if (/10[\s._-]?bits?\b|\b10bit\b/i.test(t)) out.push("10bit");
+      if (/hevc|h[\s._-]?265|x265/i.test(t)) out.push("HEVC");
+      else if (/\bav1\b/i.test(t)) out.push("AV1");
+      else if (/h[\s._-]?264|x264|\bavc\b/i.test(t)) out.push("H264");
+      else if (/\bvp9\b/i.test(t)) out.push("VP9");
+      if (/atmos|全景声/i.test(t)) out.push("Atmos");
+      else if (/dts[\s._-]*hd|dts[\s._-]*x/i.test(t)) out.push("DTS-HD");
+      else if (/truehd/i.test(t)) out.push("TrueHD");
+      else if (/ddp|eac3|dd\+|dolby[\s._-]*digital[\s._-]*plus/i.test(t)) out.push("DD+");
+      else if (/\bdts\b/i.test(t)) out.push("DTS");
+      else if (/\bac3\b/i.test(t)) out.push("AC3");
+      return out;
+    }
+
+    /** 一条流的完整画质描述：档位 + 细节标记（同一语义去重、限长） */
+    function hdQualityLabel(item) {
+      var it = item || {};
+      var blob = [it.name, it.desc, it.filename, it.title].filter(Boolean).join(" ");
+      var tierLabel = (it.tier && it.tier.label) || "";
+      // 「其他」没有分辨率：退回用流的 name / 首行描述（如 BDRip、WEB-DL），比「其他」有信息量
+      if (!tierLabel || tierLabel === "其他") {
+        var raw = str(it.name || it.title).split("\n")[0].replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim();
+        tierLabel = raw ? raw.slice(0, 16) : tierLabel;
+      }
+      var parts = [tierLabel].concat(hdQualityTags(blob)).filter(Boolean);
+      var seen = {}, out = [];
+      parts.forEach(function (p) {
+        var k = String(p).toLowerCase();
+        if (seen[k]) return;
+        seen[k] = 1;
+        out.push(p);
+      });
+      return out.join(" ").replace(/[$#]/g, " ").trim().slice(0, 42);
+    }
+
     /** 单条 HdHub 流 → 统一结构 */
     function parseStream(s) {
       var url = str(s && (s.url || s.externalUrl));
@@ -7096,6 +7873,34 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       };
     }
 
+    /**
+     * 「画质档位」白名单。HdHub 配置页的 qualities 是「保留」语义（不是排除），
+     * 以前只写进 manifest 配置段，一旦手动填了插件地址就完全失效，所以本地也执行一次。
+     * 返回 null 表示不限制。
+     */
+    function qualityWhitelist() {
+      var raw = str(cfg.qualities).trim().toLowerCase();
+      if (!raw || /^(all|全部|\*)$/.test(raw)) return null;
+      var set = {};
+      raw.split(/[,|\s]+/).forEach(function (token) {
+        var name = str(token).trim();
+        if (!name) return;
+        if (/^(2160p?|4k|uhd)$/.test(name)) set["4K"] = 1;
+        else if (/^(1080p?|fhd)$/.test(name)) set["1080P"] = 1;
+        else if (/^(720p?|hd)$/.test(name)) set["720P"] = 1;
+        else if (/^(480p?|360p?|sd)$/.test(name)) set["SD"] = 1;
+        else if (/^(other|其他)$/.test(name)) set["其他"] = 1;
+      });
+      return Object.keys(set).length ? set : null;
+    }
+    /** 该流是否在「画质档位」白名单内 */
+    function hdQualityAllowed(item) {
+      var white = qualityWhitelist();
+      if (!white) return true;
+      var label = (item && item.tier && item.tier.label) || "其他";
+      return !!white[label];
+    }
+
     async function fetchStreams(kind, imdb, season, episode) {
       var type = kind === "series" ? "series" : "movie";
       var id = str(imdb);
@@ -7106,12 +7911,14 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       var url = addonBase() + "/stream/" + type + "/" + encodeURIComponent(id) + ".json";
       var d = await httpJson(url, { timeout: num(cfg.streamTimeoutMs, 90000) });
       var list = (d && Array.isArray(d.streams)) ? d.streams : [];
-      var out = [];
+      var out = [], dropped = 0;
       list.forEach(function (s) {
         var p = parseStream(s);
         if (!p.url) return;              // 捐赠 / Discord 之类的纯外链宣传行，直接丢
+        if (!hdQualityAllowed(p)) { dropped++; return; }
         out.push(p);
       });
+      if (dropped) log("画质档位筛选丢弃 " + dropped + " 条（保留：" + str(cfg.qualities) + "）");
       return out;
     }
 
@@ -7190,10 +7997,10 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       var t = str(vid);
       var m = t.match(/^hd\|(movie|series)\|(tt\d{5,10})(?:\|(\d+)\|(\d+))?$/);
       if (m) return { kind: m[1], imdb: m[2], season: Number(m[3]) || 0, episode: Number(m[4]) || 0 };
-      m = t.match(/^hd\|(movie|series)\|tmdb:(\d+)$/);
-      if (m) return { kind: m[1], tmdbId: Number(m[2]) };
-      m = t.match(/^tmdb:(movie|series|tv):(\d+)$/);
-      if (m) return { kind: m[1] === "movie" ? "movie" : "series", tmdbId: Number(m[2]) };
+      m = t.match(/^hd\|(movie|series)\|tmdb:(\d+)(?::s(\d+))?$/);
+      if (m) return { kind: m[1], tmdbId: Number(m[2]), season: Number(m[3]) || 0 };
+      m = t.match(/^tmdb:(movie|series|tv):(\d+)(?::s(\d+))?$/);
+      if (m) return { kind: m[1] === "movie" ? "movie" : "series", tmdbId: Number(m[2]), season: Number(m[3]) || 0 };
       m = t.match(/^(tt\d{5,10})(?::(\d+):(\d+))?$/);
       if (m) return { kind: m[2] ? "series" : "movie", imdb: m[1], season: Number(m[2]) || 0, episode: Number(m[3]) || 0 };
       return null;
@@ -7253,8 +8060,9 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
         var arr = tiers[lb];
         if (!arr || !arr.length) return;
         var lines = arr.slice(0, Number(num(cfg.maxResults, 40))).map(function (it) {
-          var bits = [lb, it.size, it.provider].filter(Boolean);
-          var label = bits.join(" · ").replace(/[$#]/g, " ");
+          // 线路名带详细画质（杜比视界 / HDR / 编码 / 音轨）+ 体积 / 片源站
+          var bits = [hdQualityLabel(it), it.size, it.provider].filter(Boolean);
+          var label = bits.join(" \u00B7 ").replace(/[$#]/g, " ");
           return label + "$" + slotOf({ k: "u", u: it.url, n: it.filename || it.title });
         });
         groups.push(lines.join("#"));
@@ -7266,38 +8074,52 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       return { groups: groups, froms: froms, total: items.length, playableCount: playable.length };
     }
 
-    /** 剧集：eps 由详情页给（Cinemeta 分集，缺失时用 TMDB 第一季）；只探一次画质档，分集线路起播时再解析 */
-    async function buildSeriesLists(req, imdb, eps) {
+    /**
+     * 剧集：按季出一组线路（和 Emby 一致：一季一组，组内是该季全部集）。
+     *   · 季数选择交给详情页的线路组切换，不再把所有集塞进一组里；
+     *   · 不在详情页按画质分组（那样「选画质」会和「选季」挤在同一层，只能看到一组）；
+     *   · 也不再探路取流（省掉详情页一次 5~30 秒的请求），画质在点播时现取。
+     */
+    async function buildSeriesLists(req, imdb, eps, preferSeason) {
       eps = Array.isArray(eps) ? eps : [];
       if (!eps.length) {
         return { groups: ["自动选源(推荐)$" + slotOf({ k: "a", id: "series:" + imdb + ":1:1", q: "" })], froms: ["HdHub"], total: 0, playableCount: 0, noEpisodes: true };
       }
-      // 用第一集探一次画质档（超时不影响出线路）
-      var tiers = ["4K", "1080P", "720P"];
-      try {
-        var probe = await fetchStreams("series", imdb, eps[0].s, eps[0].e);
-        var found = {};
-        dedupeAndRank(probe).forEach(function (it) { if (it.cls.playable) found[it.tier.label] = 1; });
-        var ks = ["4K", "1080P", "720P", "SD"].filter(function (x) { return found[x]; });
-        if (ks.length) tiers = ks;
-      } catch (e) { warn("探路取流失败：" + ((e && e.message) || e)); }
-
+      // 按季归组
+      var bySeason = {}, order = [];
+      eps.forEach(function (ep) {
+        var s = Number(ep.s) || 1, e = Number(ep.e) || 0;
+        if (!e) return;
+        if (!bySeason[s]) { bySeason[s] = []; order.push(s); }
+        bySeason[s].push(ep);
+      });
+      // 指定季优先（搜索「某某 第四季」进来时，第 4 季排第一组），其余按季号升序
+      var preferS = Number(preferSeason) || 0;
+      order.sort(function (a, b) {
+        if (preferS) {
+          var pa = a === preferS ? 0 : 1, pb = b === preferS ? 0 : 1;
+          if (pa !== pb) return pa - pb;
+        }
+        return a - b;
+      });
       var limit = Number(num(cfg.maxResults, 40));
-      var groups = [], froms = [];
-      tiers.forEach(function (lb) {
-        var lines = eps.slice(0, limit).map(function (ep) {
-          var label = "第" + String(ep.s).padStart(2, "0") + "季 第" + String(ep.e).padStart(2, "0") + "集" + (ep.name ? " " + ep.name.replace(/[$#]/g, " ").slice(0, 18) : "");
-          return label + "$" + slotOf({ k: "a", id: "series:" + imdb + ":" + ep.s + ":" + ep.e, q: lb });
+      var groups = [], froms = [], total = 0;
+      order.forEach(function (s) {
+        var list = bySeason[s].slice().sort(function (a, b) { return (Number(a.e) || 0) - (Number(b.e) || 0); }).slice(0, limit);
+        if (!list.length) return;
+        var lines = list.map(function (ep) {
+          var nm = str(ep.name).replace(/[$#]/g, " ").trim();
+          return ("第" + ep.e + "集" + (nm ? " " + nm.slice(0, 20) : "")) + "$" + slotOf({ k: "a", id: "series:" + imdb + ":" + ep.s + ":" + ep.e, q: "" });
         });
         groups.push(lines.join("#"));
-        froms.push("HdHub " + lb + "(" + lines.length + ")");
+        froms.push("第 " + s + " 季");
+        total += lines.length;
       });
-      // 只有一档时也补一条「按集数直接播」，防止探路失败导致没线路
-      groups.push(eps.slice(0, limit).map(function (ep) {
-        return "第" + String(ep.s).padStart(2, "0") + "季 第" + String(ep.e).padStart(2, "0") + "集$" + slotOf({ k: "a", id: "series:" + imdb + ":" + ep.s + ":" + ep.e, q: "" });
-      }).join("#"));
-      froms.push("HdHub 全部");
-      return { groups: groups, froms: froms, total: eps.length, playableCount: tiers.length };
+      if (!groups.length) {
+        return { groups: ["自动选源(推荐)$" + slotOf({ k: "a", id: "series:" + imdb + ":1:1", q: "" })], froms: ["HdHub"], total: 0, playableCount: 0, noEpisodes: true };
+      }
+      // playableCount 这里表示「季数」，detail 的提示语据此改成「分 N 季」
+      return { groups: groups, froms: froms, total: total, playableCount: groups.length, seasonCount: groups.length };
     }
 
     /* ---------------------------------------------------------------- 站点 API */
@@ -7448,9 +8270,415 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       return s;
     }
 
-    /** 关键词 → TMDB 条目（中文优先，返回 {list, total, totalPages}） */
+    /** 中文数字 → 整数（支持 零~九十九 的常见写法：四、十、十一、二十三） */
+    function cnNum(text) {
+      var t = str(text).replace(/\s+/g, "");
+      if (!t) return 0;
+      if (/^\d+$/.test(t)) return parseInt(t, 10);
+      var map = { "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9 };
+      var m = t.match(/^([一二两三四五六七八九])?十([一二三四五六七八九])?$/);
+      if (m) return (m[1] ? map[m[1]] : 1) * 10 + (m[2] ? map[m[2]] : 0);
+      if (t.length === 1 && map[t] !== undefined) return map[t];
+      return 0;
+    }
+
+    /**
+     * 搜索候选词列表（按优先级）：原词 → 剥掉季数的片名 → 去掉标点/空格的版本。
+     * ★ 原词必须排第一：片名本身带数字时（海王2、蛟龙行动2）原词才是对的，
+     *   直接剥季数会把它搜成「海王」，命中一堆不相干的老片。
+     */
+
+    /* ================= 季数感知搜索内核（片名 + 第N季） ================= */
+    /* 旧实现「原词优先，原词 0 命中才剥季数」有三个问题：
+       ① 剥季数只认空格分隔，中文习惯的「侠探杰克第四季」「片名（第四季）」「Reacher S4」剥不掉；
+       ② 只要原词有任意命中就再也不试剥季后的片名；
+       ③ 剥季后不考虑「同名多部」（海贼王 1999 / 2023），目标条目常被挤到第 2 页。
+       下面统一处理：识别季 → 剥季 → 出候选 → 打分排序。 */
+
+    /** 中文数字 → 整数（只覆盖季数里出现的 1~99：四、十、十一、二十三） */
+    var SP_CN = { "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9 };
+    function spCnNum(t) {
+      t = String(t == null ? "" : t).replace(/\s+/g, "");
+      if (!t) return 0;
+      if (/^\d+$/.test(t)) return parseInt(t, 10);
+      var m = t.match(/^([一二两三四五六七八九])?十([一二三四五六七八九])?$/);
+      if (m) return (m[1] ? SP_CN[m[1]] : 1) * 10 + (m[2] ? SP_CN[m[2]] : 0);
+      if (t.length === 1 && SP_CN[t] !== undefined) return SP_CN[t];
+      return 0;
+    }
+
+    function spNowYear() { return new Date().getFullYear(); }
+
+    /** 统一成半角、单空格（全角括号留着，交给 spUnbracket 决定去留） */
+    function spCleanQuery(x) {
+      return String(x == null ? "" : x)
+        .replace(/[\uFF01-\uFF5E]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
+        .replace(/\u3000/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    /** 括号里的内容拆出来（「片名（第四季）」→「片名 第四季」），后面统一由剥季处理 */
+    function spUnbracket(t) {
+      return String(t || "")
+        .replace(/[（(]\s*([^（）()]{1,80}?)\s*[）)]/g, " $1 ")
+        .replace(/【\s*([^【】]{1,80}?)\s*】/g, " $1 ")
+        .trim();
+    }
+
+    /**
+     * 从查询里识别「季」并返回剥离后的片名 → { title, season }。
+     * 支持：第四季 / 第 4 季 / 第四期 / 第四部(非「部分」) / Season 4 / season4 / S04 / 片名（第四季）
+     *      片名-S4 / 片名 S4 / 片名 4（裸数字必须带空格）
+     * 防误伤：海王2、蛟龙行动2 这种片名自带数字不会被剥（没有空格不算季数），
+     *        而且调用方永远把原词也放进候选，真剥错也能救回来。
+     */
+    function findSeasonTag(wd) {
+      var raw = String(wd == null ? "" : wd).trim();
+      if (!raw) return { title: "", season: 0 };
+      var t = spCleanQuery(spUnbracket(raw));
+      var season = 0, hit = "";
+      var pats = [
+        /第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部](?!分)/,  // 第四季
+        /(?:^|[^a-z])season\s*([0-9]{1,2})(?![0-9])/i,                          // Season 4
+        /([0-9]{1,2})\s*season(?![a-z])/i,                                        // 4 Season
+        /(?:^|[^a-z0-9])s\s?([0-9]{1,2})(?![0-9a-z])/i,                           // S04 / S4
+        /([0-9]{1,2})\s?s\s?([0-9]{1,3})(?![0-9a-z])/i                            // 4s1 / 4s01
+      ];
+      for (var i = 0; i < pats.length && !season; i++) {
+        var m = t.match(pats[i]);
+        if (!m) continue;
+        var n = spCnNum(m[1]);
+        if (n > 0 && n <= 99) { season = n; hit = m[0]; }
+      }
+      var rest = t;
+      if (season && hit) rest = t.replace(hit, " ");
+      // 裸数字放最后：「Reacher 4」「侠探杰克 4」
+      if (!season) {
+        var m2 = t.match(/^(.+?)\s+([0-9]{1,2})$/);
+        if (m2 && String(m2[1]).trim()) { season = Number(m2[2]); rest = m2[1]; }
+      }
+      rest = spUnbracket(rest)
+        .replace(/[\-–—_·・•:：,，、]+/g, " ")
+        .replace(/[（(【\[\s]+$/g, "")
+        .replace(/^[\s）)】\]]+/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!rest) return { title: raw, season: 0 };   // 只输了「第四季」：退回原词
+      return { title: rest, season: season };
+    }
+
+    /** 两个片名是否同一条内容（忽略空格标点全半角） */
+    function spSameTitle(a, b) {
+      var norm = function (x) {
+        return String(x == null ? "" : x).toLowerCase()
+          .replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～·・•]/g, "");
+      };
+      var na = norm(a), nb = norm(b);
+      return !!na && na === nb;
+    }
+
+    /**
+     * 搜索候选（按优先级，已去重）：
+     *   ① 原词             —— 片名自带数字时（海王2 / 蛟龙行动 2）原词才准
+     *   ② 剥掉季数的片名   —— 「侠探杰克 第四季」→「侠探杰克」
+     *   ③ 去标点的版本     —— TMDB 里偶尔存成「Spider-Man」这类带连字符的写法
+     * 每项带 { q, type(raw|stripped), season, title }，打分时用来区分「是谁命中的」。
+     */
+    function searchPlan(wd) {
+      var raw = spCleanQuery(wd);
+      var tag = findSeasonTag(raw);
+      var out = [], seen = {};
+      function push(q, type) {
+        q = spCleanQuery(q);
+        if (!q) return;
+        var k = q.toLowerCase();
+        if (seen[k]) return;
+        seen[k] = 1;
+        out.push({ q: q, type: type, season: tag.season, title: tag.title });
+      }
+      push(raw, "raw");
+      if (tag.season > 0 && !spSameTitle(tag.title, raw)) push(tag.title, "stripped");
+      var strip = /[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～]+/g;
+      var p1 = raw.replace(strip, "");
+      if (p1 && p1 !== raw) push(p1, "raw");
+      if (tag.season > 0) {
+        var p2 = tag.title.replace(strip, "");
+        if (p2 && p2 !== tag.title) push(p2, "stripped");
+      }
+      return out;
+    }
+
+    /**
+     * 相关度打分（越大越靠前）：
+     *   片名相等 +60 / 前缀 +40 / 原文名相等 +40 / 包含 +25
+     *   「剥季片名」命中 +15（原词命中往往是无关条目）
+     *   指定季：真有这一季 +30，明确没这季 -20
+     *   热度（0~12 分，封顶）+ 年份新近度（0~10 分）：同名多部（1999/2023 海贼王）靠这两个分开
+     * item: { name, original, year, popularity, hasType?, hasYear?, seasons?（季号数组，未知就不传） }
+     */
+    function scoreCandidate(item, meta) {
+      var want = String((meta && meta.title) || "").trim();
+      var name = String((item && item.name) || "").trim();
+      var orig = String((item && item.original) || "").trim();
+      var sc = 0;
+      if (want) {
+        if (spSameTitle(name, want)) sc += 60;
+        else if (name && name.toLowerCase().indexOf(want.toLowerCase()) === 0) sc += 40;
+        else if (orig && orig.toLowerCase() === want.toLowerCase()) sc += 40;
+        else if (spSameTitle(orig, want)) sc += 40;
+        else if (name && (name.indexOf(want) >= 0 || want.indexOf(name) >= 0)) sc += 25;
+      }
+      if (meta && meta.type === "stripped") sc += 15;
+      if (meta && Number(meta.season) > 0 && Array.isArray(item && item.seasons)) {
+        sc += item.seasons.indexOf(Number(meta.season)) >= 0 ? 30 : -20;
+      }
+      // 元数据越完整越可信：TMDB 里存在「无类型、无年份、热度极低」的僵尸条目，
+      // 光靠片名相等（+60）会把它顶到真正的剧集前面（实测「Reacher S4」就踩到了）
+      // 缺类型且缺年份 = 多半是空壳条目，扣 15；缺其中一项只扣 5（正常条目常缺地区/年份）
+      if (item) {
+        if (!item.hasType && !item.hasYear) sc -= 15;
+        else if (!item.hasType || !item.hasYear) sc -= 5;
+      }
+      // 热度（对数，封顶 12）与票数（对数，封顶 25）：
+      //   真剧集动辄上千票（Reacher 4k+、ONE PIECE 100k+），空壳条目 0~几十票 → 自然沉底
+      var pop = Number((item && item.popularity) || 0);
+      if (pop > 0) sc += Math.min(12, Math.log(pop + 1) * 1.8);
+      var votes = Number((item && item.votes) || 0);
+      if (votes > 0) sc += Math.min(25, Math.log(votes + 1) * 3.2);
+      var y = Number(String((item && item.year) || "").slice(0, 4)) || 0;
+      if (y > 1900) sc += Math.max(0, 10 - Math.abs(spNowYear() - y) * 0.5);
+      return sc;
+    }
+
+    /** 按打分降序排序（稳定排序：同分保持上游原顺序） */
+    function spSortByScore(list, meta) {
+      var scored = (list || []).map(function (it, i) { return { it: it, sc: scoreCandidate(it, meta), i: i }; });
+      scored.sort(function (a, b) { return (b.sc - a.sc) || (a.i - b.i); });
+      return scored.map(function (x) { return x.it; });
+    }
+
+    /** 季名 → 季号：「Season 4」「第四季」「S4」都能认（Emby 自定义季名常见这几种） */
+    function spSeasonNumberOf(name) {
+      var t = String(name == null ? "" : name);
+      var m = t.match(/season\s*([0-9]{1,2})/i);
+      if (m) return Number(m[1]);
+      m = t.match(/第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部]/);
+      if (m) return spCnNum(m[1]);
+      m = t.match(/^\s*s\s?([0-9]{1,2})\s*$/i);
+      if (m) return Number(m[1]);
+      return 0;
+    }
+
+    /** 剧集：把「目标季」排到第一组（详情页进来就能看到） */
+    function planSeasonOrder(plans, wantSeason) {
+      var ws = Number(wantSeason) || 0;
+      var arr = Array.isArray(plans) ? plans.slice() : [];
+      if (!ws || arr.length < 2) return arr;
+      var idx = -1;
+      for (var i = 0; i < arr.length; i++) {
+        if (Number(arr[i] && arr[i].s) === ws) { idx = i; break; }
+      }
+      if (idx <= 0) return arr;
+      return [arr[idx]].concat(arr.filter(function (_, k) { return k !== idx; }));
+    }
+
+    /**
+     * 让 tmdbVod 生成的每个条目带上 TMDB 原件。
+     * 为什么不在 tmdbVod 里直接写 tmdbItem：它是在原始压缩包里的一行，
+     * 直接改容易和超长行里的其它代码打架；这里改成「按需包装一次」，幂等且可控。
+     * 用途：搜索排序要 genre_ids / popularity / vote_count 判断谁是正主。
+     */
+    function ensureTmdbItem() {
+      if (globalThis.__lmTioVodWrapped === tmdbVod) return;
+      var orig = tmdbVod;
+      if (orig.__tmdbItemWrapped) { globalThis.__lmTioVodWrapped = tmdbVod; return; }
+      tmdbVod = function (item, kind) {
+        var v = orig(item, kind);
+        if (v && item) { try { v.tmdbItem = item; } catch (e) { } }
+        return v;
+      };
+      tmdbVod.__tmdbItemWrapped = true;
+      globalThis.__lmTioVodWrapped = tmdbVod;
+    }
+
+    /**
+     * 小并发跑 async 任务，结果按原顺序返回。
+     * 用途：拿到一个剧的所有季/集清单后补「季列表」，串行请求会拖慢十几秒。
+     */
+    async function spMapLimit(arr, limit, fn) {
+      arr = Array.isArray(arr) ? arr : [];
+      var out = new Array(arr.length), next = 0, workers = [];
+      var n = Math.max(1, Math.min(limit || 4, arr.length || 1));
+      for (var w = 0; w < n; w++) {
+        workers.push((async function () {
+          while (true) {
+            var i = next++;
+            if (i >= arr.length) return;
+            try { out[i] = await fn(arr[i], i); } catch (e) { out[i] = null; }
+          }
+        })());
+      }
+      await Promise.all(workers);
+      return out;
+    }
+
+    /* 旧版剥季数的实现（保留，供 searchVariants 兜底时对照；新搜索链路不再直接用它） */
+    function __spLegacySearchVariants(wd) {
+      var raw = normWord(wd);
+      var sq = splitSeasonQuery(wd);
+      var out = [];
+      var push = function (x) {
+        x = str(x).replace(/\s+/g, " ").trim();
+        if (x && out.indexOf(x) < 0) out.push(x);
+      };
+      push(raw);
+      push(sq.title);
+      push(raw.replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～]+/g, ""));
+      return out.length ? out : [raw];
+    }
+
+    /**
+     * 搜索候选词（按优先级）：内核见 searchPlan（季数感知版）。
+     * 函数名保持不变 —— search / tmdbSearchList / IMDb 兜底都在调用它，
+     * 改成「原词 + 剥季片名 + 去标点」且剥季规则支持中文习惯（第四季 / S4 / 全角括号）。
+     */
+    function searchVariants(wd) {
+      return searchPlan(wd).map(function (x) { return x.q; });
+    }
+
+    /**
+     * 两个片名是否「同一条内容」：忽略空格、标点、全半角差异。
+     * 用于判定要不要给搜索结果打「第 N 季」标记 —— 只有片名一致才打，
+     * 避免搜「权力的游戏 第八季」时把只有 2 季的《龙族》也标成第 8 季。
+     */
+    function sameTitle(a, b) {
+      var norm = function (x) {
+        return String(x == null ? "" : x).toLowerCase()
+          .replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～·・•]/g, "");
+      };
+      var na = norm(a), nb = norm(b);
+      return !!na && na === nb;
+    }
+
+    /**
+     * 从搜索词里剥离「季数」后缀，返回 { title, season }。
+     * ★ 用户习惯直接搜「侠探杰克 第四季」，但 TMDB / IMDb / Emby 都是按片名索引的，
+     *   整句带上季数会 0 命中（实测 TMDB 搜「侠探杰克 第四季」total_results=0，搜「侠探杰克」有 1 条）。
+     * 支持：第四季 / 第4季 / 第 4 季 / 第四部 / Season 4 / S04 / S4。
+     */
+    function splitSeasonQuery(wd) {
+      var raw = normWord(wd);
+      var t = raw, season = 0, m;
+      m = t.match(/第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部]/);
+      if (m) {
+        var n = cnNum(m[1]);
+        if (n > 0) { season = n; t = t.replace(m[0], " "); }
+      }
+      if (!season) {
+        m = t.match(/(?:^|[\s\-_])(?:season|s)\s*([0-9]{1,2})(?:$|[\s\-_])/i);
+        if (m) {
+          var n2 = Number(m[1]);
+          if (n2 > 0) { season = n2; t = t.replace(m[0], " "); }
+        }
+      }
+      // 末尾裸数字：「侠探杰克 4」「Reacher S4」这类常见手写。
+      // 必须带空格/分隔符，否则「海王2」这种片名本身带数字会被误剥（那种情况靠「原词优先」兜住）。
+      if (!season) {
+        m = t.match(/^(.+?)[\s\-_]+([0-9]{1,2})$/);
+        if (m && str(m[1]).trim()) {
+          var n3 = Number(m[2]);
+          if (n3 > 0) { season = n3; t = str(m[1]); }
+        }
+      }
+      t = t.replace(/\s+/g, " ").trim();
+      // 剥完变空（用户只输了「第四季」）就退回原词，别把查询清空
+      if (!t) t = raw;
+      return { title: t, season: season };
+    }
+
+
+    /**
+     * 关键词 → TMDB 条目（中文优先，返回 {list, total, totalPages}）
+     * ★ 改造要点（原来搜「侠探杰克 第四季」直接搜不到）：
+     *   1. 候选词改成 searchPlan：原词 / 剥季片名 / 去标点，剥季规则支持中文习惯；
+     *   2. 不再「原词有结果就返回」：原词和剥季片名都查一遍，合并后统一打分排序。
+     *      搜「权力的游戏 第八季」时，原词会命中一堆无关条目，剥季后的片名才排得上来；
+     *   3. 打分里「目标季确实存在」加分、同名多部按热度/新近度区分，
+     *      所以「海贼王 第十季」不会把 1999 年老版顶到前面。
+     */
     async function tmdbSearchList(wd, page) {
-      var q = normWord(wd);
+      ensureTmdbItem();
+      var plan = searchPlan(wd);
+      var sq = findSeasonTag(wd);
+      var last = { list: [], total: 0, totalPages: 1 };
+      var merged = [], seen = {}, anyTotal = 0;
+      // 候选个数：带季数时只查「原词 + 剥季片名」两个，没季数就只查原词（不额外拖慢普通搜索）
+      var want = sq.season > 0 ? Math.min(2, plan.length) : 1;
+      for (var vi = 0; vi < plan.length; vi++) {
+        // 有季数时最多查 2 个候选（原词 + 剥季片名），没有就按候选顺序查，够用且不拖慢页面
+        if (vi >= (sq.season > 0 ? 2 : plan.length)) break;
+        // ★ 候选词「并行」查：TMDB 在国内网络单次就要 4 秒+，串行查两个候选 = 8~9 秒，
+        //   客户端早就超时把结果丢了（表现就是「搜索一直转圈 / 空列表」）
+        var results = await Promise.all(plan.slice(0, want).map(function (pl) {
+          return tmdbSearchOne(pl.q, page, sq.season, sq.title).catch(function () { return null; });
+        }));
+        for (var wi = 0; wi < results.length; wi++) {
+          var r = results[wi];
+          if (!r) continue;
+          if (!(r.list && r.list.length)) { if (r.totalPages > (last.totalPages || 1)) last = r; continue; }
+          anyTotal = Math.max(anyTotal, Number(r.total) || 0);
+          for (var k = 0; k < r.list.length; k++) {
+            var v = r.list[k];
+            var key = String(v.vod_id || "");
+            if (!key || seen[key]) continue;
+            seen[key] = 1;
+            var ti = v.tmdbItem || {};
+            merged.push({
+              v: v, name: v.vod_name,
+              original: ti.original_title || ti.original_name || "",
+              year: v.vod_year, hasYear: !!v.vod_year,
+              hasType: Array.isArray(ti.genre_ids) && ti.genre_ids.length > 0,
+              popularity: Number(ti.popularity || 0),
+              votes: Number(ti.vote_count || 0)
+            });
+          }
+        }
+        break;   // 并行查完就结束，不走原来的循环
+        // 调试：AB_DEBUG 打开时打印每个候选的命中数与头部条目
+        if (!r) continue;
+        if (r.list && r.list.length) {
+          anyTotal = Math.max(anyTotal, Number(r.total) || 0);
+          for (var k = 0; k < r.list.length; k++) {
+            var v = r.list[k];
+            var key = String(v.vod_id || "");
+            if (!key || seen[key]) continue;
+            seen[key] = 1;
+            // 打分需要的元数据全部来自 TMDB 原件（tmdbItem）：
+            //   genre_ids 判断「是不是一条正经条目」，vote_count 区分正主与空壳
+            var ti = (v && v.tmdbItem) || {};
+            merged.push({
+              v: v, name: v.vod_name,
+              original: ti.original_title || ti.original_name || "",
+              year: v.vod_year, hasYear: !!v.vod_year,
+              hasType: Array.isArray(ti.genre_ids) && ti.genre_ids.length > 0,
+              popularity: Number(ti.popularity || 0),
+              votes: Number(ti.vote_count || 0)
+            });
+          }
+        } else if (r.totalPages > (last.totalPages || 1)) {
+          last = r;   // 记住分页信息，万一全都 0 命中也能原样返回
+        }
+      }
+      if (!merged.length) return last;
+      // 目标季排前面 + 片名相关度排序（分页信息取命中最多的那个候选）
+      var sortedItems = spSortByScore(merged, { title: sq.title || wd, season: sq.season });
+      var sorted = sortedItems.map(function (x) { return (x && x.v) || x; });
+      return { list: sorted, total: Math.max(anyTotal, sorted.length), totalPages: Math.max(1, Number(last.totalPages) || page) };
+    }
+
+    /** 单次 TMDB 搜索（只查一个查询词） */
+    async function tmdbSearchOne(q, page, wantSeason, showTitle) {
       var seen = Object.create(null), list = [], total = 0, totalPages = 1;
       function take(arr, kind) {
         (arr || []).forEach(function (x) {
@@ -7459,7 +8687,14 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
           if (seen[k]) return;
           seen[k] = 1;
           var v = tmdbVod(x, kind);
-          if (v) list.push({ v: v, src: x, kind: kind });
+          if (v) {
+            // 指定了季：只给「片名与搜索词一致」的剧集打季标并编进 vod_id（避免把只有 2 季的衍生剧标成第 8 季）
+            if (wantSeason > 0 && kind !== "movie" && sameTitle(v.vod_name, showTitle)) {
+              v.vod_id = v.vod_id + ":s" + wantSeason;
+              v.vod_remarks = "第 " + wantSeason + " 季 · " + v.vod_remarks;
+            }
+            list.push({ v: v, src: x, kind: kind });
+          }
         });
       }
       // 1) multi（电影 + 剧集一次拿全）
@@ -7533,7 +8768,12 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
         warn("TMDB 搜索失败，回落 Cinemeta：" + ((e && e.message) || e));
       }
       try {
-        var metas = await ciSearch(wd);
+        // 兜底也用同一套候选词（Cinemeta 同样按片名索引），逐个试到有结果
+        var metas = [];
+        var vs2 = searchVariants(wd);
+        for (var vi2 = 0; vi2 < vs2.length && !metas.length; vi2++) {
+          try { metas = await ciSearch(vs2[vi2]); } catch (e3) { metas = []; }
+        }
         var list2 = metas.map(function (m) { return vodOfMeta(m, m.type === "series" ? "series" : "movie"); }).filter(Boolean);
         return { page: page, pagecount: page, limit: list2.length, total: list2.length, list: list2, msg: list2.length ? "" : ("没有找到「" + wd + "」") };
       } catch (e2) {
@@ -7596,12 +8836,11 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
             var waitMs = num(cfg.detailWaitMs, 45000);
             var job;
             if (info.kind === "series") {
-              var eps = (meta && Array.isArray(meta.videos) ? meta.videos : [])
-                .filter(function (v) { return v && Number(v.season) > 0 && Number(v.number || v.episode) > 0; })
-                .map(function (v) { return { s: Number(v.season), e: Number(v.number || v.episode), name: str(v.name) }; })
-                .sort(function (a, b) { return a.s - b.s || a.e - b.e; });
-              if (!eps.length && tmdbData && info.tmdbId) eps = await tmdbEpisodes(info.tmdbId);
-              job = buildSeriesLists(req, imdb, eps);
+              // Cinemeta（含分集名）与 TMDB（全季骨架）取并集，任一来源缺季都能补齐
+              var eps = await seriesEpisodeList(meta, imdb, info.tmdbId || (tmdbData && tmdbData.id));
+              // 搜索时带了季数（如「侠探杰克 第四季」）：把这一季排到第一组。
+              // 先按季号排序再交给 buildSeriesLists（它内部还会按 preferSeason 排一次，双保险）
+              job = buildSeriesLists(req, imdb, planSeasonOrder(eps, info.season || 0), info.season || 0);
             } else {
               job = buildMovieLists(req, imdb);
             }
@@ -7618,7 +8857,9 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
         if (lists && lists.groups && lists.groups.length) {
           vod.vod_play_url = lists.groups.join("$$$");
           vod.vod_play_from = (lists.froms || []).join("$$$");
-          note = "HdHub 共 " + (lists.total || 0) + " 条资源，可直连播放 " + (lists.playableCount || 0) + " 条";
+          note = (info.kind === "series" && lists.seasonCount)
+            ? ("HdHub 共 " + (lists.total || 0) + " 集，分 " + lists.seasonCount + " 季")
+            : ("HdHub 共 " + (lists.total || 0) + " 条资源，可直连播放 " + (lists.playableCount || 0) + " 条");
         } else if (imdb) {
           var fb = (info.kind === "series")
             ? slotOf({ k: "a", id: "series:" + imdb + ":" + (info.season || 1) + ":" + (info.episode || 1), q: "" })
@@ -7637,6 +8878,22 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
     }
 
     /** TMDB 剧集 → 第一季分集（Cinemeta 缺分集时兜底） */
+    /**
+     * IMDb → TMDB id（剧集）。用 TMDB 官方 find 接口，一次请求即可，
+     * 主要用于「Cinemeta 缺季」时改走 TMDB 拿全季。
+     */
+    async function tmdbIdOfImdb(imdb) {
+      var id = str(imdb);
+      if (!/^tt\d{5,10}$/.test(id)) return 0;
+      try {
+        var d = await tmdbGet("/find/" + id, { external_source: "imdb_id" });
+        var tv = (d && Array.isArray(d.tv_results)) ? d.tv_results[0] : null;
+        if (tv && tv.id) return Number(tv.id);
+      } catch (e) { warn("IMDb→TMDB 失败：" + ((e && e.message) || e)); }
+      return 0;
+    }
+
+    /** TMDB 剧集 → 第一季分集（保留给旧调用） */
     async function tmdbEpisodes(tmdbId) {
       try {
         var d = await tmdbGet("/tv/" + tmdbId + "/season/1");
@@ -7646,6 +8903,57 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       } catch (e) { return []; }
     }
 
+    /**
+     * TMDB 剧集 → 全部季的全部分集。
+     * 先用 /tv/{id} 的 seasons（自带 episode_count）把所有季的集号铺出来，
+     * 避免逐季请求；成功后再并发取各季详情补上分集名（失败不影响集号）。
+     * ★ 旧实现在这里只取第一季，多季剧会缺季。
+     */
+    async function tmdbSeasonEpisodes(tmdbId) {
+      var id = Number(tmdbId) || 0;
+      if (!id) return [];
+      var seasons = [];
+      try {
+        var td = await tmdbGet("/tv/" + id);
+        seasons = (td && Array.isArray(td.seasons) ? td.seasons : [])
+          .filter(function (s) { return Number(s.season_number) > 0 && Number(s.episode_count) > 0; })
+          .map(function (s) { return { s: Number(s.season_number), cnt: Number(s.episode_count), name: str(s.name) }; })
+          .sort(function (a, b) { return a.s - b.s; });
+      } catch (e) { warn("TMDB 季列表失败：" + ((e && e.message) || e)); }
+      if (!seasons.length) return await tmdbEpisodes(id);
+      var out = [];
+      seasons.forEach(function (sea) {
+        for (var e = 1; e <= sea.cnt; e++) out.push({ s: sea.s, e: e, name: "" });
+      });
+      return out;
+    }
+
+    /**
+     * 剧集分集清单：Cinemeta（通常含全部季 + 分集名）与 TMDB（全季骨架）取并集。
+     * ★ 旧实现只信一个来源，任一来源缺季就会少季；并集可以互补。
+     */
+    async function seriesEpisodeList(meta, imdb, tmdbId) {
+      // ① Cinemeta
+      var ci = (meta && Array.isArray(meta.videos) ? meta.videos : [])
+        .filter(function (v) { return v && Number(v.season) > 0 && Number(v.number || v.episode) > 0; })
+        .map(function (v) { return { s: Number(v.season), e: Number(v.number || v.episode), name: str(v.name) }; });
+      // ② TMDB
+      var tid = Number(tmdbId) || 0;
+      if (!tid && /^tt\d{5,10}$/.test(str(imdb))) tid = await tmdbIdOfImdb(imdb);
+      var tm = await tmdbSeasonEpisodes(tid);
+      // 并集：按 季:集 去重，名字取先出现的非空值
+      var map = {}, order = [];
+      [ci, tm].forEach(function (list) {
+        (list || []).forEach(function (x) {
+          var sn = Number(x.s), en = Number(x.e);
+          if (!(sn > 0) || !en) return;
+          var k = sn + ":" + en;
+          if (!map[k]) { map[k] = { s: sn, e: en, name: str(x.name) }; order.push(k); }
+          else if (!map[k].name && str(x.name)) map[k].name = str(x.name);
+        });
+      });
+      return Object.keys(map).map(function (k) { return map[k]; });
+    }
     /** 从一组流里挑出「指定画质」的一条；没有就退回最可播的那条 */
     function pickByTier(items, tierLabel) {
       var playable = items.filter(function (it) { return it.cls.playable; });
@@ -7664,6 +8972,55 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
         return (b.sizeBytes || 0) - (a.sizeBytes || 0);
       });
       return pool[0];
+    }
+
+    /**
+     * 剧集多画质：把这一集的全部可播源做成播放页「画质」数组（平铺「名称, 地址, 名称, 地址 …」）。
+     * 返回 null 表示拿不到两条以上，交给原来的单选逻辑兜底。
+     */
+    async function seriesQualityEntries(req, items, want) {
+      var pool = items.filter(function (it) { return it.cls.playable; });
+      // 可播项不足两条时，尽力解析网盘落地页（并发、最多 3 条），否则画质菜单只有一项
+      if (pool.length < 2 && bool(cfg.resolveLanding, true)) {
+        var landings = items.filter(function (it) { return !it.cls.playable && it.cls.kind === "landing"; }).slice(0, 3);
+        if (landings.length) {
+          var found = await Promise.all(landings.map(function (it) {
+            return resolveLanding(it.url).catch(function () { return ""; });
+          }));
+          landings.forEach(function (it, i) {
+            var direct = found[i];
+            if (!direct) return;
+            it.url = direct;
+            it.cls = { rank: 2, kind: "direct", playable: true };
+            pool.push(it);
+          });
+        }
+      }
+      if (pool.length < 2) return null;
+      // 排序：画质从高到低，其次体积；want 指定的画质提到最前（兼容旧详情页缓存下来的线路 id）
+      pool.sort(function (a, b) {
+        var d = (b.tier.rank || 0) - (a.tier.rank || 0);
+        return d !== 0 ? d : (b.sizeBytes || 0) - (a.sizeBytes || 0);
+      });
+      if (want) {
+        var first = pool.filter(function (it) { return it.tier.label === want; });
+        if (first.length) pool = first.concat(pool.filter(function (it) { return it.tier.label !== want; }));
+      }
+      var arr = [], seenUrl = {}, usedLabel = {};
+      for (var i = 0; i < pool.length && arr.length < 24; i++) {
+        var it = pool[i];
+        var u = playUrlFor(req, it);
+        if (!u || seenUrl[u]) continue;
+        seenUrl[u] = 1;
+        // 名称不能含 $ 和 #（vod_play_url 的分隔符）；画质描述带杜比视界 / HDR / 编码 / 音轨
+        var label = [hdQualityLabel(it), it.size, it.provider].filter(Boolean).join(" \u00B7 ").replace(/[$#]/g, " ").trim();
+        if (!label) label = "线路" + (arr.length / 2 + 1);
+        var base = label, dup = 2;
+        while (usedLabel[label]) label = base + " #" + dup++;
+        usedLabel[label] = 1;
+        arr.push(label, u);
+      }
+      return arr.length >= 4 ? arr : null;
     }
 
     async function play(req) {
@@ -7706,6 +9063,17 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
       try {
         var streams = await fetchStreams(kind, imdb, season, episode);
         var items = dedupeAndRank(streams);
+        // 剧集：画质在播放页选 —— 把这一集的所有画质做成多线路数组，默认最高画质
+        if (kind === "series") {
+          var qArr = await seriesQualityEntries(req, items, want);
+          if (qArr) {
+            log("播放 " + imdb + " S" + season + "E" + episode + " 多画质 " + (qArr.length / 2) + " 条：" + qArr.filter(function (x, i2) { return i2 % 2 === 0; }).join(" / "));
+            return {
+              code: 0, url: qArr, urls: qArr, parse: 0, header: {},
+              extra: { message: "HdHub 共 " + (qArr.length / 2) + " 个画质，可在播放页切换" }
+            };
+          }
+        }
         var pick = pickByTier(items, want);
         if (!pick) return { code: 1, url: "", message: "HdHub 没有返回可播放的资源，请换一集或稍后再试" };
         if (!pick.cls.playable && bool(cfg.resolveLanding, true)) {
@@ -7805,7 +9173,22 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
           POST("/category", category);
           POST("/detail", detail);
           POST("/play", play);
-          POST("/search", search);
+          // 诊断：搜「片名+季数」出问题时，这一行能看出请求体、候选词和最终命中数
+          router.post("/search", async function (req, reply) {
+            var t0 = Date.now();
+            try {
+              var body = (req && req.body) || {};
+              var plan = searchPlan(body.wd || body.keyword || body.k || body.q || "");
+              var r = await search(req, reply);
+              log("[season] " + KEY + " body=" + JSON.stringify(body).slice(0, 160) +
+                " → 候选=[" + plan.map(function (x) { return x.q + "/" + x.type; }).join(", ") + "]" +
+                " → 命中 " + ((r && r.list && r.list.length) || 0) + " 条 (" + (Date.now() - t0) + "ms)");
+              return r;
+            } catch (e) {
+              log("[season] " + KEY + " 搜索异常：" + ((e && e.stack) || (e && e.message) || e));
+              return { page: 1, pagecount: 1, limit: 0, total: 0, list: [], msg: "搜索异常：" + ((e && e.message) || e) };
+            }
+          });
           router.route({ method: ["GET", "HEAD"], url: "/stream", handler: streamProxy });
         },
         check: async function () { return cfg.enable !== false; },
@@ -7826,7 +9209,7 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
             note: "默认直接用你给的 HdHub 插件地址；想换站点/参数时把「手动填地址」关掉，下面按参数自动生成。",
             fields: [
               { k: "enable", label: "启用本来源", type: "switch", on: "启用" },
-              { k: "useManifestUrl", label: "手动填插件地址", type: "switch", on: "手动", note: "关掉后使用下面「站点域名 + 参数」自动生成 manifest 地址" },
+              { k: "useManifestUrl", label: "手动填插件地址", type: "switch", on: "手动", note: "关闭时用「站点域名 + 参数」现拼地址，下面画质档位等参数改了就生效；只有当你在下方粘贴了与内置默认不同的地址，才会改用你填的那条" },
               { k: "manifestUrl", label: "插件 manifest 地址", type: "text", ph: "https://hdhub.xxx/manifest.json", note: "HdHub 官方「Manifest URL」那一串，原样粘贴" },
               { k: "host", label: "站点域名（自动生成时用）", type: "text", ph: "hdhub.thevolecitor.qzz.io", note: "只填域名，不要带 https:// 和结尾斜杠" },
               { k: "manifestTimeoutMs", label: "manifest 超时（毫秒）", type: "text", ph: "12000", note: "manifest 拉不到时会自动跳过插件目录，不影响 TMDB 首页" }
@@ -7846,7 +9229,7 @@ globalThis.lmTorrentioCore = function () { return __tioBuild(); };
             title: "HdHub 插件自带参数",
             note: "与官方配置页一一对应；改动后会自动生成新的插件地址（手动填地址模式除外）。",
             fields: [
-              { k: "qualities", label: "画质档位", type: "text", ph: "2160p,1080p,720p", note: "可填 2160p,1080p,720p,480p，或用 all" },
+              { k: "qualities", label: "画质档位（保留）", type: "text", ph: "2160p,1080p,720p", note: "只保留这些档位：2160p,1080p,720p,480p，或用 all 不限制。本地还会再按此筛选一次，手填插件地址时同样生效" },
               { k: "catalogs", label: "首页分类", type: "text", ph: "featured,popular", note: "featured=推荐，popular=热门；留空则只有「热门」" },
               { k: "content", label: "内容类型", type: "text", ph: "留空=默认", note: "可填 asian,french,german,italian,latin,portuguese（逗号分隔）" },
               { k: "sort", label: "默认排序", type: "select", options: [["体积/画质从大到小（desc）", "desc"], ["体积/画质从小到大（asc）", "asc"]] },
@@ -35784,7 +37167,463 @@ t5lYKfpe8k83ZA==
 `;break;case"r":t+="\r";break;case"t":t+="	";break;case"b":t+="\b";break;case"f":t+="\f";break;case"v":t+="\v";break;default:t+=a}else t+=a}return i||this.throwError('Unclosed quote after "'+t+'"'),{type:e.LITERAL,value:t,raw:this.expr.substring(r,this.index)}}gobbleIdentifier(){let t=this.code,r=this.index;for(e.isIdentifierStart(t)?this.index++:this.throwError("Unexpected "+this.char);this.index<this.expr.length&&(t=this.code,e.isIdentifierPart(t));)this.index++;return{type:e.IDENTIFIER,name:this.expr.slice(r,this.index)}}gobbleArguments(t){let r=[],n=!1,i=0;for(;this.index<this.expr.length;){this.gobbleSpaces();let a=this.code;if(a===t){n=!0,this.index++,t===e.CPAREN_CODE&&i&&i>=r.length&&this.throwError("Unexpected token "+String.fromCharCode(t));break}else if(a===e.COMMA_CODE){if(this.index++,i++,i!==r.length){if(t===e.CPAREN_CODE)this.throwError("Unexpected token ,");else if(t===e.CBRACK_CODE)for(let s=r.length;s<i;s++)r.push(null)}}else if(r.length!==i&&i!==0)this.throwError("Expected comma");else{let s=this.gobbleExpression();(!s||s.type===e.COMPOUND)&&this.throwError("Expected comma"),r.push(s)}}return n||this.throwError("Expected "+String.fromCharCode(t)),r}gobbleGroup(){this.index++;let t=this.gobbleExpressions(e.CPAREN_CODE);if(this.code===e.CPAREN_CODE)return this.index++,t.length===1?t[0]:t.length?{type:e.SEQUENCE_EXP,expressions:t}:!1;this.throwError("Unclosed (")}gobbleArray(){return this.index++,{type:e.ARRAY_EXP,elements:this.gobbleArguments(e.CBRACK_CODE)}}},Uri=new JKe;Object.assign(Sx,{hooks:Uri,plugins:new ZKe(Sx),COMPOUND:"Compound",SEQUENCE_EXP:"SequenceExpression",IDENTIFIER:"Identifier",MEMBER_EXP:"MemberExpression",LITERAL:"Literal",THIS_EXP:"ThisExpression",CALL_EXP:"CallExpression",UNARY_EXP:"UnaryExpression",BINARY_EXP:"BinaryExpression",ARRAY_EXP:"ArrayExpression",TAB_CODE:9,LF_CODE:10,CR_CODE:13,SPACE_CODE:32,PERIOD_CODE:46,COMMA_CODE:44,SQUOTE_CODE:39,DQUOTE_CODE:34,OPAREN_CODE:40,CPAREN_CODE:41,OBRACK_CODE:91,CBRACK_CODE:93,QUMARK_CODE:63,SEMCOL_CODE:59,COLON_CODE:58,unary_ops:{"-":1,"!":1,"~":1,"+":1},binary_ops:{"||":1,"??":1,"&&":2,"|":3,"^":4,"&":5,"==":6,"!=":6,"===":6,"!==":6,"<":7,">":7,"<=":7,">=":7,"<<":8,">>":8,">>>":8,"+":9,"-":9,"*":10,"/":10,"%":10,"**":11},right_associative:new Set(["**"]),additional_identifier_chars:new Set(["$","_"]),literals:{true:!0,false:!1,null:null},this_str:"this"});Sx.max_unop_len=Sx.getMaxKeyLen(Sx.unary_ops);Sx.max_binop_len=Sx.getMaxKeyLen(Sx.binary_ops);var YA=e=>new Sx(e).parse(),Bri=Object.getOwnPropertyNames(class{});Object.getOwnPropertyNames(Sx).filter(e=>!Bri.includes(e)&&YA[e]===void 0).forEach(e=>{YA[e]=Sx[e]});YA.Jsep=Sx;var Fri="ConditionalExpression",$ri={name:"ternary",init(e){e.hooks.add("after-expression",function(r){if(r.node&&this.code===e.QUMARK_CODE){this.index++;let n=r.node,i=this.gobbleExpression();if(i||this.throwError("Expected expression"),this.gobbleSpaces(),this.code===e.COLON_CODE){this.index++;let a=this.gobbleExpression();if(a||this.throwError("Expected expression"),r.node={type:Fri,test:n,consequent:i,alternate:a},n.operator&&e.binary_ops[n.operator]<=.9){let s=n;for(;s.right.operator&&e.binary_ops[s.right.operator]<=.9;)s=s.right;r.node.test=s.right,s.right=r.node,r.node=n}}else this.throwError("Expected :")}})}};YA.plugins.register($ri);var A6r=47,jri=92,Vri={name:"regex",init(e){e.hooks.add("gobble-token",function(r){if(this.code===A6r){let n=++this.index,i=!1;for(;this.index<this.expr.length;){if(this.code===A6r&&!i){let a=this.expr.slice(n,this.index),s="";for(;++this.index<this.expr.length;){let c=this.code;if(c>=97&&c<=122||c>=65&&c<=90||c>=48&&c<=57)s+=this.char;else break}let o;try{o=new RegExp(a,s)}catch(c){this.throwError(c.message)}return r.node={type:e.LITERAL,value:o,raw:this.expr.slice(n-1,this.index)},r.node=this.gobbleTokenProperty(r.node),r.node}this.code===e.OBRACK_CODE?i=!0:i&&this.code===e.CBRACK_CODE&&(i=!1),this.index+=this.code===jri?2:1}this.throwError("Unclosed Regex")}})}},QKe=43,Hri=45,D5={name:"assignment",assignmentOperators:new Set(["=","*=","**=","/=","%=","+=","-=","<<=",">>=",">>>=","&=","^=","|=","||=","&&=","??="]),updateOperators:[QKe,Hri],assignmentPrecedence:.9,init(e){let t=[e.IDENTIFIER,e.MEMBER_EXP];D5.assignmentOperators.forEach(n=>e.addBinaryOp(n,D5.assignmentPrecedence,!0)),e.hooks.add("gobble-token",function(i){let a=this.code;D5.updateOperators.some(s=>s===a&&s===this.expr.charCodeAt(this.index+1))&&(this.index+=2,i.node={type:"UpdateExpression",operator:a===QKe?"++":"--",argument:this.gobbleTokenProperty(this.gobbleIdentifier()),prefix:!0},(!i.node.argument||!t.includes(i.node.argument.type))&&this.throwError(`Unexpected ${i.node.operator}`))}),e.hooks.add("after-token",function(i){if(i.node){let a=this.code;D5.updateOperators.some(s=>s===a&&s===this.expr.charCodeAt(this.index+1))&&(t.includes(i.node.type)||this.throwError(`Unexpected ${i.node.operator}`),this.index+=2,i.node={type:"UpdateExpression",operator:a===QKe?"++":"--",argument:i.node,prefix:!1})}}),e.hooks.add("after-expression",function(i){i.node&&r(i.node)});function r(n){D5.assignmentOperators.has(n.operator)?(n.type="AssignmentExpression",r(n.left),r(n.right)):n.operator||Object.values(n).forEach(i=>{i&&typeof i=="object"&&r(i)})}}};YA.plugins.register(Vri,D5);YA.addUnaryOp("typeof");YA.addLiteral("null",null);YA.addLiteral("undefined",void 0);var zri=new Set(["constructor","__proto__","__defineGetter__","__defineSetter__"]),Aa={evalAst(e,t){switch(e.type){case"BinaryExpression":case"LogicalExpression":return Aa.evalBinaryExpression(e,t);case"Compound":return Aa.evalCompound(e,t);case"ConditionalExpression":return Aa.evalConditionalExpression(e,t);case"Identifier":return Aa.evalIdentifier(e,t);case"Literal":return Aa.evalLiteral(e,t);case"MemberExpression":return Aa.evalMemberExpression(e,t);case"UnaryExpression":return Aa.evalUnaryExpression(e,t);case"ArrayExpression":return Aa.evalArrayExpression(e,t);case"CallExpression":return Aa.evalCallExpression(e,t);case"AssignmentExpression":return Aa.evalAssignmentExpression(e,t);default:throw SyntaxError("Unexpected expression",e)}},evalBinaryExpression(e,t){return{"||":(n,i)=>n||i(),"&&":(n,i)=>n&&i(),"|":(n,i)=>n|i(),"^":(n,i)=>n^i(),"&":(n,i)=>n&i(),"==":(n,i)=>n==i(),"!=":(n,i)=>n!=i(),"===":(n,i)=>n===i(),"!==":(n,i)=>n!==i(),"<":(n,i)=>n<i(),">":(n,i)=>n>i(),"<=":(n,i)=>n<=i(),">=":(n,i)=>n>=i(),"<<":(n,i)=>n<<i(),">>":(n,i)=>n>>i(),">>>":(n,i)=>n>>>i(),"+":(n,i)=>n+i(),"-":(n,i)=>n-i(),"*":(n,i)=>n*i(),"/":(n,i)=>n/i(),"%":(n,i)=>n%i()}[e.operator](Aa.evalAst(e.left,t),()=>Aa.evalAst(e.right,t))},evalCompound(e,t){let r;for(let n=0;n<e.body.length;n++){e.body[n].type==="Identifier"&&["var","let","const"].includes(e.body[n].name)&&e.body[n+1]&&e.body[n+1].type==="AssignmentExpression"&&(n+=1);let i=e.body[n];r=Aa.evalAst(i,t)}return r},evalConditionalExpression(e,t){return Aa.evalAst(e.test,t)?Aa.evalAst(e.consequent,t):Aa.evalAst(e.alternate,t)},evalIdentifier(e,t){if(Object.hasOwn(t,e.name))return t[e.name];throw ReferenceError(`${e.name} is not defined`)},evalLiteral(e){return e.value},evalMemberExpression(e,t){let r=String(e.computed?Aa.evalAst(e.property):e.property.name),n=Aa.evalAst(e.object,t);if(n==null)throw TypeError(`Cannot read properties of ${n} (reading '${r}')`);if(!Object.hasOwn(n,r)&&zri.has(r))throw TypeError(`Cannot read properties of ${n} (reading '${r}')`);let i=n[r];return typeof i=="function"?i.bind(n):i},evalUnaryExpression(e,t){return{"-":n=>-Aa.evalAst(n,t),"!":n=>!Aa.evalAst(n,t),"~":n=>~Aa.evalAst(n,t),"+":n=>+Aa.evalAst(n,t),typeof:n=>typeof Aa.evalAst(n,t)}[e.operator](e.argument)},evalArrayExpression(e,t){return e.elements.map(r=>Aa.evalAst(r,t))},evalCallExpression(e,t){let r=e.arguments.map(i=>Aa.evalAst(i,t));return Aa.evalAst(e.callee,t)(...r)},evalAssignmentExpression(e,t){if(e.left.type!=="Identifier")throw SyntaxError("Invalid left-hand side in assignment");let r=e.left.name,n=Aa.evalAst(e.right,t);return t[r]=n,t[r]}},eqe=class{constructor(t){this.code=t,this.ast=YA(this.code)}runInNewContext(t){let r=Object.assign(Object.create(null),t);return Aa.evalAst(this.ast,r)}};function NE(e,t){return e=e.slice(),e.push(t),e}function tqe(e,t){return t=t.slice(),t.unshift(e),t}var rqe=class extends Error{constructor(t){super('JSONPath should not be called with "new" (it prevents return of (unwrapped) scalar values)'),this.avoidNew=!0,this.value=t,this.name="NewError"}};function bi(e,t,r,n,i){if(!(this instanceof bi))try{return new bi(e,t,r,n,i)}catch(s){if(!s.avoidNew)throw s;return s.value}typeof e=="string"&&(i=n,n=r,r=t,t=e,e=null);let a=e&&typeof e=="object";if(e=e||{},this.json=e.json||r,this.path=e.path||t,this.resultType=e.resultType||"value",this.flatten=e.flatten||!1,this.wrap=Object.hasOwn(e,"wrap")?e.wrap:!0,this.sandbox=e.sandbox||{},this.eval=e.eval===void 0?"safe":e.eval,this.ignoreEvalErrors=typeof e.ignoreEvalErrors>"u"?!1:e.ignoreEvalErrors,this.parent=e.parent||null,this.parentProperty=e.parentProperty||null,this.callback=e.callback||n||null,this.otherTypeCallback=e.otherTypeCallback||i||function(){throw new TypeError("You must supply an otherTypeCallback callback option with the @other() operator.")},e.autostart!==!1){let s={path:a?e.path:t};a?"json"in e&&(s.json=e.json):s.json=r;let o=this.evaluate(s);if(!o||typeof o!="object")throw new rqe(o);return o}}bi.prototype.evaluate=function(e,t,r,n){let i=this.parent,a=this.parentProperty,{flatten:s,wrap:o}=this;if(this.currResultType=this.resultType,this.currEval=this.eval,this.currSandbox=this.sandbox,r=r||this.callback,this.currOtherTypeCallback=n||this.otherTypeCallback,t=t||this.json,e=e||this.path,e&&typeof e=="object"&&!Array.isArray(e)){if(!e.path&&e.path!=="")throw new TypeError('You must supply a "path" property when providing an object argument to JSONPath.evaluate().');if(!Object.hasOwn(e,"json"))throw new TypeError('You must supply a "json" property when providing an object argument to JSONPath.evaluate().');({json:t}=e),s=Object.hasOwn(e,"flatten")?e.flatten:s,this.currResultType=Object.hasOwn(e,"resultType")?e.resultType:this.currResultType,this.currSandbox=Object.hasOwn(e,"sandbox")?e.sandbox:this.currSandbox,o=Object.hasOwn(e,"wrap")?e.wrap:o,this.currEval=Object.hasOwn(e,"eval")?e.eval:this.currEval,r=Object.hasOwn(e,"callback")?e.callback:r,this.currOtherTypeCallback=Object.hasOwn(e,"otherTypeCallback")?e.otherTypeCallback:this.currOtherTypeCallback,i=Object.hasOwn(e,"parent")?e.parent:i,a=Object.hasOwn(e,"parentProperty")?e.parentProperty:a,e=e.path}if(i=i||null,a=a||null,Array.isArray(e)&&(e=bi.toPathString(e)),!e&&e!==""||!t)return;let c=bi.toPathArray(e);c[0]==="$"&&c.length>1&&c.shift(),this._hasParentSelector=null;let u=this._trace(c,t,["$"],i,a,r).filter(function(l){return l&&!l.isParentSelector});return u.length?!o&&u.length===1&&!u[0].hasArrExpr?this._getPreferredOutput(u[0]):u.reduce((l,x)=>{let d=this._getPreferredOutput(x);return s&&Array.isArray(d)?l=l.concat(d):l.push(d),l},[]):o?[]:void 0};bi.prototype._getPreferredOutput=function(e){let t=this.currResultType;switch(t){case"all":{let r=Array.isArray(e.path)?e.path:bi.toPathArray(e.path);return e.pointer=bi.toPointer(r),e.path=typeof e.path=="string"?e.path:bi.toPathString(e.path),e}case"value":case"parent":case"parentProperty":return e[t];case"path":return bi.toPathString(e[t]);case"pointer":return bi.toPointer(e.path);default:throw new TypeError("Unknown result type")}};bi.prototype._handleCallback=function(e,t,r){if(t){let n=this._getPreferredOutput(e);e.path=typeof e.path=="string"?e.path:bi.toPathString(e.path),t(n,r,e)}};bi.prototype._trace=function(e,t,r,n,i,a,s,o){let c;if(!e.length)return c={path:r,value:t,parent:n,parentProperty:i,hasArrExpr:s},this._handleCallback(c,a,"value"),c;let u=e[0],l=e.slice(1),x=[];function d(f){Array.isArray(f)?f.forEach(p=>{x.push(p)}):x.push(f)}if((typeof u!="string"||o)&&t&&Object.hasOwn(t,u))d(this._trace(l,t[u],NE(r,u),t,u,a,s));else if(u==="*")this._walk(t,f=>{d(this._trace(l,t[f],NE(r,f),t,f,a,!0,!0))});else if(u==="..")d(this._trace(l,t,r,n,i,a,s)),this._walk(t,f=>{typeof t[f]=="object"&&d(this._trace(e.slice(),t[f],NE(r,f),t,f,a,!0))});else{if(u==="^")return this._hasParentSelector=!0,{path:r.slice(0,-1),expr:l,isParentSelector:!0};if(u==="~")return c={path:NE(r,u),value:i,parent:n,parentProperty:null},this._handleCallback(c,a,"property"),c;if(u==="$")d(this._trace(l,t,r,null,null,a,s));else if(/^(-?\d*):(-?\d*):?(\d*)$/u.test(u))d(this._slice(u,l,t,r,n,i,a));else if(u.indexOf("?(")===0){if(this.currEval===!1)throw new Error("Eval [?(expr)] prevented in JSONPath expression.");let f=u.replace(/^\?\((.*?)\)$/u,"$1"),p=/@.?([^?]*)[['](\??\(.*?\))(?!.\)\])[\]']/gu.exec(f);p?this._walk(t,m=>{let g=[p[2]],h=p[1]?t[m][p[1]]:t[m];this._trace(g,h,r,n,i,a,!0).length>0&&d(this._trace(l,t[m],NE(r,m),t,m,a,!0))}):this._walk(t,m=>{this._eval(f,t[m],m,r,n,i)&&d(this._trace(l,t[m],NE(r,m),t,m,a,!0))})}else if(u[0]==="("){if(this.currEval===!1)throw new Error("Eval [(expr)] prevented in JSONPath expression.");d(this._trace(tqe(this._eval(u,t,r.at(-1),r.slice(0,-1),n,i),l),t,r,n,i,a,s))}else if(u[0]==="@"){let f=!1,p=u.slice(1,-2);switch(p){case"scalar":(!t||!["object","function"].includes(typeof t))&&(f=!0);break;case"boolean":case"string":case"undefined":case"function":typeof t===p&&(f=!0);break;case"integer":Number.isFinite(t)&&!(t%1)&&(f=!0);break;case"number":Number.isFinite(t)&&(f=!0);break;case"nonFinite":typeof t=="number"&&!Number.isFinite(t)&&(f=!0);break;case"object":t&&typeof t===p&&(f=!0);break;case"array":Array.isArray(t)&&(f=!0);break;case"other":f=this.currOtherTypeCallback(t,r,n,i);break;case"null":t===null&&(f=!0);break;default:throw new TypeError("Unknown value type "+p)}if(f)return c={path:r,value:t,parent:n,parentProperty:i},this._handleCallback(c,a,"value"),c}else if(u[0]==="`"&&t&&Object.hasOwn(t,u.slice(1))){let f=u.slice(1);d(this._trace(l,t[f],NE(r,f),t,f,a,s,!0))}else if(u.includes(",")){let f=u.split(",");for(let p of f)d(this._trace(tqe(p,l),t,r,n,i,a,!0))}else!o&&t&&Object.hasOwn(t,u)&&d(this._trace(l,t[u],NE(r,u),t,u,a,s,!0))}if(this._hasParentSelector)for(let f=0;f<x.length;f++){let p=x[f];if(p&&p.isParentSelector){let m=this._trace(p.expr,t,p.path,n,i,a,s);if(Array.isArray(m)){x[f]=m[0];let g=m.length;for(let h=1;h<g;h++)f++,x.splice(f,0,m[h])}else x[f]=m}}return x};bi.prototype._walk=function(e,t){if(Array.isArray(e)){let r=e.length;for(let n=0;n<r;n++)t(n)}else e&&typeof e=="object"&&Object.keys(e).forEach(r=>{t(r)})};bi.prototype._slice=function(e,t,r,n,i,a,s){if(!Array.isArray(r))return;let o=r.length,c=e.split(":"),u=c[2]&&Number.parseInt(c[2])||1,l=c[0]&&Number.parseInt(c[0])||0,x=c[1]&&Number.parseInt(c[1])||o;l=l<0?Math.max(0,l+o):Math.min(o,l),x=x<0?Math.max(0,x+o):Math.min(o,x);let d=[];for(let f=l;f<x;f+=u)this._trace(tqe(f,t),r,n,i,a,s,!0).forEach(m=>{d.push(m)});return d};bi.prototype._eval=function(e,t,r,n,i,a){this.currSandbox._$_parentProperty=a,this.currSandbox._$_parent=i,this.currSandbox._$_property=r,this.currSandbox._$_root=this.json,this.currSandbox._$_v=t;let s=e.includes("@path");s&&(this.currSandbox._$_path=bi.toPathString(n.concat([r])));let o=this.currEval+"Script:"+e;if(!bi.cache[o]){let c=e.replaceAll("@parentProperty","_$_parentProperty").replaceAll("@parent","_$_parent").replaceAll("@property","_$_property").replaceAll("@root","_$_root").replaceAll(/@([.\s)[])/gu,"_$_v$1");if(s&&(c=c.replaceAll("@path","_$_path")),this.currEval==="safe"||this.currEval===!0||this.currEval===void 0)bi.cache[o]=new this.safeVm.Script(c);else if(this.currEval==="native")bi.cache[o]=new this.vm.Script(c);else if(typeof this.currEval=="function"&&this.currEval.prototype&&Object.hasOwn(this.currEval.prototype,"runInNewContext")){let u=this.currEval;bi.cache[o]=new u(c)}else if(typeof this.currEval=="function")bi.cache[o]={runInNewContext:u=>this.currEval(c,u)};else throw new TypeError(`Unknown "eval" property "${this.currEval}"`)}try{return bi.cache[o].runInNewContext(this.currSandbox)}catch(c){if(this.ignoreEvalErrors)return!1;throw new Error("jsonPath: "+c.message+": "+e)}};bi.cache={};bi.toPathString=function(e){let t=e,r=t.length,n="$";for(let i=1;i<r;i++)/^(~|\^|@.*?\(\))$/u.test(t[i])||(n+=/^[0-9*]+$/u.test(t[i])?"["+t[i]+"]":"['"+t[i]+"']");return n};bi.toPointer=function(e){let t=e,r=t.length,n="";for(let i=1;i<r;i++)/^(~|\^|@.*?\(\))$/u.test(t[i])||(n+="/"+t[i].toString().replaceAll("~","~0").replaceAll("/","~1"));return n};bi.toPathArray=function(e){let{cache:t}=bi;if(t[e])return t[e].concat();let r=[],i=e.replaceAll(/@(?:null|boolean|number|string|integer|undefined|nonFinite|scalar|array|object|function|other)\(\)/gu,";$&;").replaceAll(/[['](\??\(.*?\))[\]'](?!.\])/gu,function(a,s){return"[#"+(r.push(s)-1)+"]"}).replaceAll(/\[['"]([^'\]]*)['"]\]/gu,function(a,s){return"['"+s.replaceAll(".","%@%").replaceAll("~","%%@@%%")+"']"}).replaceAll("~",";~;").replaceAll(/['"]?\.['"]?(?![^[]*\])|\[['"]?/gu,";").replaceAll("%@%",".").replaceAll("%%@@%%","~").replaceAll(/(?:;)?(\^+)(?:;)?/gu,function(a,s){return";"+s.split("").join(";")+";"}).replaceAll(/;;;|;;/gu,";..;").replaceAll(/;$|'?\]|'$/gu,"").split(";").map(function(a){let s=a.match(/#(\d+)/u);return!s||!s[1]?a:r[s[1]]});return t[e]=i,t[e].concat()};bi.prototype.safeVm={Script:eqe};bi.prototype.vm=b6r.default;var nqe=(e,t)=>{if(e=e||"",t=t||"",!t)return e;if(!e)return t;try{return new URL(t,e).toString()}catch{return t}},iqe={query(e,t){return bi.JSONPath({path:t,json:e})}},boe=!0,v6r=":eq|:lt|:gt|:first|:last|:not|:even|:odd|:has|:contains|:matches|:empty|^body$|^#",Kri="(url|src|href|-original|-src|-play|-url|style)$|^(data-|url-|src-)",qri="^(ftp|magnet|thunder|ws):",aqe=class{constructor(t=""){this.MY_URL=t,this.pdfh_html="",this.pdfa_html="",this.pdfh_doc=null,this.pdfa_doc=null}test(t,r){return!!new RegExp(t,"mi").exec(r)}contains(t,r){return t.indexOf(r)!==-1}parseHikerToJq(t,r=!1){if(this.contains(t,"&&")){let n=t.split("&&"),i=[];for(let a=0;a<n.length;a++){let s=n[a].split(" "),o=s[s.length-1];this.test(v6r,o)||!r&&a>=n.length-1?i.push(n[a]):i.push(`${n[a]}:eq(0)`)}t=i.join(" ")}else{let n=t.split(" "),i=n[n.length-1];!this.test(v6r,i)&&r&&(t=`${t}:eq(0)`)}return t}getParseInfo(t){let r=[],n=0,i=t;if(this.contains(t,":eq")){i=t.split(":eq")[0];let a=t.split(":eq")[1];this.contains(i,"--")?(r=i.split("--").slice(1),i=i.split("--")[0]):this.contains(a,"--")&&(r=a.split("--").slice(1),a=a.split("--")[0]);try{n=parseInt(a.split("(")[1].split(")")[0])}catch{}}else this.contains(t,"--")&&(i=t.split("--")[0],r=t.split("--").slice(1));return{nparse_rule:i,nparse_index:n,excludes:r}}reorderAdjacentLtAndGt(t){let r=/:gt\((\d+)\):lt\((\d+)\)/,n;for(;(n=r.exec(t))!==null;){let i=`:lt(${n[2]}):gt(${n[1]})`;t=t.substring(0,n.index)+i+t.substring(n.index+n[0].length),r.lastIndex=n.index}return t}parseOneRule(t,r,n){let{nparse_rule:i,nparse_index:a,excludes:s}=this.getParseInfo(r);if(i=this.reorderAdjacentLtAndGt(i),n?n=n.find(i):n=t(i),this.contains(r,":eq")&&(n=n.eq(a)),s.length>0&&n){n=n.clone();for(let o of s)n.find(o).remove()}return n}parseText(t){return t=t.replace(/[\s]+/gm,`
 `),t=t.replace(/\n+/g,`
 `).replace(/^\s+/,""),t=t.replace(/\n/g," "),t}pdfa(t,r){if(!t||!r)return[];r=this.parseHikerToJq(r);let n;boe&&this.pdfa_html===t&&this.pdfa_doc?n=this.pdfa_doc:(n=Rt(t),boe&&(this.pdfa_html=t,this.pdfa_doc=n));let i=r.split(" "),a=null;for(let o of i)if(a=this.parseOneRule(n,o,a),!a)return[];return(a?.toArray()??[]).map(o=>{let c=`${n(o)}`;return c||""})}pdfl(t,r,n,i,a){if(!t||!r)return[];r=this.parseHikerToJq(r,!1);let s=[],o=Rt(t),c=r.split(" "),u=null;for(let l of c)if(u=this.parseOneRule(o,l,u),!u)return[];return u.each((l,x)=>{s.push(`${o(x)}`)}),s}pdfh(t,r,n=""){if(!t||!r)return"";let i;if(boe&&this.pdfh_html===t&&this.pdfh_doc?i=this.pdfh_doc:(i=Rt(t),boe&&(this.pdfh_html=t,this.pdfh_doc=i)),r==="body&&Text"||r==="Text")return this.parseText(i.text());if(r==="body&&Html"||r==="Html")return i.html();let a;if(this.contains(r,"&&")){let c=r.split("&&");a=c.pop(),r=c.join("&&")}r=this.parseHikerToJq(r,!0);let s=r.split(" "),o=null;for(let c of s)if(o=this.parseOneRule(i,c,o),!o)return"";if(a)switch(a){case"Text":o=o?this.parseText(o.text()):"";break;case"Html":o=o?o.html():"";break;default:let c=o.clone(),u=a.split("||");for(let l of u){if(o=c?.attr(l)||"",this.contains(l.toLowerCase(),"style")&&this.contains(o,"url("))try{o=o.match(/url\((.*?)\)/)[1],o=o.replace(/^['"]|['"]$/g,"")}catch{}if(o&&n&&this.test(Kri,l)&&!this.test(qri,o)&&(o=o.includes("http")?o.slice(o.indexOf("http")):nqe(n,o)),o)break}}else o=`${o}`;return o}pd(t,r,n=""){return n||(n=this.MY_URL),this.pdfh(t,r,n)}pq(t){return Rt(t)}pjfh(t,r,n=!1){if(!t||!r)return"";try{t=typeof t=="string"?JSON.parse(t):t}catch{return""}r.startsWith("$.")||(r="$."+r);let i="",a=r.split("||");for(let s of a){let o=iqe.query(t,s);if(i=Array.isArray(o)?o[0]||"":o||"",n&&i&&(i=nqe(this.MY_URL,i)),i)break}return i}pj(t,r){return this.pjfh(t,r,!0)}pjfa(t,r){if(!t||!r)return[];try{t=typeof t=="string"?JSON.parse(t):t}catch{return[]}r.startsWith("$.")||(r="$."+r);let n=iqe.query(t,r);return Array.isArray(n)&&Array.isArray(n[0])&&n.length===1?n[0]:n||[]}},sqe=aqe;On();qs();_o();Ci();pQe();Es();var AQe={crypto:{default:Kue.default||Kue,...Kue},axios:{default:Se,...Se},cheerio:{default:Vs,...Vs},"crypto-js":{default:mQe.default,...mQe.default},"iconv-lite":{default:hQe.default,...hQe.default},http2:{default:gQe.default,...gQe.default},"jpeg-js":{default:yQe.default,...yQe.default},qs:{default:_Qe.default,..._Qe.default},"tough-cookie":{default:Aoe,...Aoe},"runtime-context":XKe,req:BVe,htmlParser:oqe,"home-cache":iHe,pan:iQe,"concurrency-limiter":uQe,misc:lqe,"m3u8-ad-cleaner":fQe,"lru-cache":{default:vt}};globalThis.__CAT_JS_UTIL=AQe;try{Object.defineProperty(AQe,"torrent",{configurable:!0,enumerable:!0,get(){try{var m=globalThis.lmTorrentReady().module;return Object.assign({default:m},m,{playUrl:function(g,req,opt){return globalThis.lmMagnet.play(g,req,opt)}})}catch(e){console.error("[torrent] \u811A\u672C\u6A21\u5757\u52A0\u8F7D\u5931\u8D25\uFF1A"+(e&&e.message||e));return{default:{}}}}})}catch(e){}try{Object.defineProperty(AQe,"magnet",{configurable:!0,enumerable:!0,get(){return globalThis.lmMagnet}})}catch(e){}try{globalThis.__lmRequire=function(name){var s=String(name==null?"":name).trim(),key=s,m=/(?:^|\/)(?:util|core)\/([A-Za-z0-9_@.-]+?)(?:\.js)?$/.exec(s);if(m)key=m[1];else{m=/^(?:\.\/)?([A-Za-z0-9_@.\/-]+?)(?:\.js)?$/.exec(s);if(m)key=m[1]}if(!Object.prototype.hasOwnProperty.call(AQe,key))throw new Error("\u672A\u5185\u7F6E\u6A21\u5757\uFF1A"+s);var mod=AQe[key];return(mod&&mod.default!==void 0)?mod.default:mod};globalThis.__lmRequireHeader="const require=globalThis.__lmRequire;\n"}catch(e){}var Umi=`${Wd.default.sep}spider${Wd.default.sep}video${Wd.default.sep}`;function Bmi(e,t){return e&&typeof e=="object"?{...e}:{name:String(e||"").trim(),path:String(t||"").trim()}}function h7r(e){return String(e||"").trim().replace(/^nodejs_/,"").replace(/[^a-zA-Z0-9_\-]/g,"_").replace(/^_+|_+$/g,"")}function Fmi(e){let t=String(e||"").trim();if(!t)throw new Error("JS \u6587\u4EF6\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A");if(/^file:\/\//i.test(t))return(0,Gue.fileURLToPath)(new URL(t));let r=t.startsWith("~")?Wd.default.join(process.env.HOME||"",t.slice(1)):t;return Wd.default.isAbsolute(r)?r:Wd.default.resolve(process.env.NODE_PATH||process.cwd(),r)}function $mi(e,t){let r=`globalThis.__CAT_JS_UTIL[${JSON.stringify(t)}]`,n=String(e||"").trim(),i=n.match(/^\*\s+as\s+([A-Za-z_$][\w$]*)$/);if(i)return`const ${i[1]} = ${r};`;let a=[],s=null,o=null,c=n.indexOf("{");if(c===-1)n&&(s=n);else{let u=n.slice(0,c).replace(/,\s*$/,"").trim();u&&(s=u);let l=n.indexOf("}",c);o=n.slice(c+1,l)}if(s&&a.push(`const ${s} = ${r}.default;`),o!=null){let u=o.split(",").map(l=>l.trim()).filter(Boolean).map(l=>{let x=l.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);return x?`${x[1]}: ${x[2]}`:l});u.length&&a.push(`const { ${u.join(", ")} } = ${r};`)}return a.join(`
-`)}function jmi(e){let t=String(e||"").match(/(?:^|\/)core\/([A-Za-z0-9_-]+)\.js$/);if(t)return{key:t[1],type:"core"};let r=String(e||"").match(/(?:^|\/)util\/([A-Za-z0-9_-]+)\.js$/);return r?{key:r[1],type:"util"}:Object.prototype.hasOwnProperty.call(AQe,e)?{key:e,type:"package"}:null}function Vmi(e){let t=[],r=/import\s+(?:[^;]*?\s+from\s+)?(['"])([^'"]+)\1\s*;?/g,n=null;for(;(n=r.exec(e))!==null;)t.push(n[2]);return t}function Hmi(e){return e.startsWith("./")||e.startsWith("../")}async function zmi(e,t){let r=Wd.default.resolve(Wd.default.dirname(e),t),n=Wd.default.extname(r)?[r]:[r,`${r}.js`,Wd.default.join(r,"index.js")];for(let i of n)try{return await que.default.access(i),!0}catch{}return!1}async function Kmi(e,t){if(Wd.default.normalize(e).includes(Umi))return!0;let r=Vmi(t);for(let n of r)if(Hmi(n)&&await zmi(e,n))return!0;return!1}async function qmi(e){let t=await que.default.stat(e),r=(0,Gue.pathToFileURL)(e);return r.searchParams.set("mtime",String(Math.floor(t.mtimeMs))),await import(r.href)}function Gmi(e,t){let r=/import\s+([^;]*?)\s+from\s+(['"])([^'"]+)\2\s*;?/g,n=new Set,i=e.replace(r,(a,s,o,c)=>{let u=jmi(c);return u?Object.prototype.hasOwnProperty.call(AQe,u.key)?$mi(s,u.key):((u.type==="util"||u.type==="core")&&n.add(`${u.type}/${u.key}.js`),a):a});return n.size&&console.error(`[js] ${t}: \u4E0A\u4F20\u811A\u672C\u4F9D\u8D56\u672A\u5185\u7F6E\u7684\u6A21\u5757 ${[...n].join("\u3001")}\uFF1B\u8BBE\u5907 bundle \u65E0 src/ \u6E90\u7801\u6811\uFF0C\u9700\u5728 src/spider/video/js.js \u7684 JS_IMPORT_REGISTRY \u8865\u5145\u5BFC\u51FA\u540E\u91CD\u65B0\u6253\u5305\u3002`),(/\brequire\s*\(/.test(i)&&!/\b(?:const|let|var|function)\s+require\b/.test(i)?(globalThis.__lmRequireHeader||""):"")+i}async function Wmi(e,t){let r=e.path||e.file,n=Fmi(r),i=await que.default.readFile(n,"utf8");if(await Kmi(n,i)){let u=await qmi(n),l=u.default||u;if(!l)throw new Error("JS \u6A21\u5757\u6CA1\u6709\u53EF\u7528\u5BFC\u51FA");return l}let a=Gmi(i,t),o=await import("data:text/javascript;charset=utf-8,"+encodeURIComponent(a)),c=o.default||o;if(!c)throw new Error("JS \u6A21\u5757\u6CA1\u6709\u53EF\u7528\u5BFC\u51FA");return c}function Ymi(e,t){if(!e||typeof e!="object")throw new Error("JS \u6A21\u5757\u5BFC\u51FA\u503C\u4E0D\u662F spider \u5BF9\u8C61");if(!e.meta||typeof e.meta!="object")throw new Error("JS \u6A21\u5757\u7F3A\u5C11 meta");if(typeof e.api!="function")throw new Error("JS \u6A21\u5757\u7F3A\u5C11 api(fastify)");let r={...e.meta},n=h7r(r.key||t.key||t.id||t.name),i=String(r.name||t.name||n||"local_js").trim();if(!n)throw new Error("JS spider key \u4E0D\u80FD\u4E3A\u7A7A");return{...e,meta:{...r,key:n,name:i,type:Number(r.type??t.type??3),js:!0}}}function bQe(e,t){let r=Bmi(e,t),n=h7r(r.key||r.id||r.name||Wd.default.basename(String(r.path||r.file||"local_js"),".js")),i=String(r.name||n||"\u672C\u5730JS").trim(),a=null;async function s(){return a||(a=(async()=>{let o=await Wmi(r,i),c=typeof o=="function"?await o(i,r):o;return Ymi(c,{...r,key:n,name:i})})()),a}return{meta:{key:n,name:i,type:Number(r.type??3),js:!0},api:async o=>{try{return(await s()).api(o)}catch(c){console.error(`[js] \u52A0\u8F7D ${i} \u5931\u8D25:`,c);let u=async(l,x)=>x.code(500).send({code:-1,message:`JS spider \u52A0\u8F7D\u5931\u8D25: ${c?.message||c}`});o.post("/init",u),o.post("/home",u),o.post("/category",u),o.post("/detail",u),o.post("/play",u),o.post("/search",u)}},check:o=>{s().then(c=>c.check?.(o)).catch(c=>console.error(`[js] \u52A0\u8F7D ${i} \u5931\u8D25:`,c))}}}br();On();var Wue=Pe(require("crypto"),1);_o();Ci();var EQe=class{constructor(){this.cache={short:new Map,medium:new Map,long:new Map},this.accessOrder={short:new Map,medium:new Map,long:new Map},this.config={short:{max:1e3,ttl:30*1e3},medium:{max:500,ttl:5*60*1e3},long:{max:200,ttl:30*60*1e3}},this.cleanupTimer=null,this.startCleanupInterval()}get(t,r="medium"){let n=this.cache[r],i=this.accessOrder[r];if(!n)return null;let a=n.get(t);return a?Date.now()>a.expiry?(n.delete(t),i?.delete(t),null):(i?.set(t,Date.now()),a.lastAccess=Date.now(),a.accessCount=(a.accessCount||0)+1,a.value):null}set(t,r,n="medium"){let i=this.cache[n],a=this.accessOrder[n];if(!i)return;let s=this.config[n];i.size>=s.max&&this.evictOldest(n),i.set(t,{value:r,expiry:Date.now()+s.ttl,type:n,setTime:Date.now(),accessCount:0,lastAccess:Date.now()}),a?.set(t,Date.now())}evictOldest(t){let r=this.cache[t],n=this.accessOrder[t],i=null,a=1/0;for(let[s]of r.entries()){let o=n?.get(s)||0;o<a&&(a=o,i=s)}i&&(r.delete(i),n?.delete(i))}generateKey(t,r={}){try{let i=Object.keys(r).sort().map(s=>`${s}=${r[s]}`),a=i.length?`${t}?${i.join("&")}`:t;return a.length>256?Wue.default.createHash("md5").update(a).digest("hex"):a}catch{return t}}clear(t=null){t?(this.cache[t]?.clear(),this.accessOrder[t]?.clear()):(Object.values(this.cache).forEach(r=>r.clear()),Object.values(this.accessOrder).forEach(r=>r.clear()))}startCleanupInterval(){this.cleanupTimer=setInterval(()=>this.cleanupExpired(),5*60*1e3),typeof this.cleanupTimer.unref=="function"&&this.cleanupTimer.unref()}cleanupExpired(){let t=Date.now();Object.entries(this.cache).forEach(([r,n])=>{let i=this.accessOrder[r];for(let[a,s]of n.entries())t>s.expiry&&(n.delete(a),i?.delete(a))})}};function Xmi(e,t={}){return JSON.stringify({id:String(e||"").trim(),meta:{...t}})}function Qmi(e){let t=String(e||"").trim();if(!t)return{id:"",meta:{}};try{let r=JSON.parse(t);return r&&typeof r=="object"&&!Array.isArray(r)&&r.id!=null?{id:String(r.id).trim(),meta:r.meta&&typeof r.meta=="object"?r.meta:{}}:{id:t,meta:{}}}catch{return{id:t,meta:{}}}}var SQe=class{constructor(t){this.config=t,this.cache=new EQe,this.queue=[],this.activeCount=0,this.maxConcurrent=t.maxConcurrent||6,this.abortControllers=new Map}async schedule(t,r=null){return this.activeCount<this.maxConcurrent?(this.activeCount++,this.execute(t,r)):new Promise((n,i)=>{this.queue.push({fn:t,resolve:n,reject:i,requestId:r})})}async execute(t,r){try{return await t()}catch(n){throw n}finally{this.activeCount--,r&&this.abortControllers.delete(r),this.processNext()}}processNext(){if(this.queue.length>0&&this.activeCount<this.maxConcurrent){let{fn:t,resolve:r,reject:n,requestId:i}=this.queue.shift();this.activeCount++,this.execute(t,i).then(r).catch(n)}}async retryRequest(t,r=3,n=1e3){let i;for(let a=0;a<=r;a++)try{let s=`req_${Wue.default.randomUUID()}`,o=new AbortController;return this.abortControllers.set(s,o),await this.schedule(async()=>{let c=this.config.timeout||1e4,u=null;try{return await Promise.race([t(o.signal),new Promise((l,x)=>{u=setTimeout(()=>{o.abort(),x(new Error(`\u8BF7\u6C42\u8D85\u65F6 (${c}ms)`))},c)})])}finally{u&&clearTimeout(u)}},s)}catch(s){if(i=s,a===r||!this.shouldRetry(s))break;await this.sleep(n*Math.pow(2,a))}throw i}shouldRetry(t){if(!t.response)return!0;let r=t.response.status;return[408,429,500,502,503,504].includes(r)}getCachedResponse(t,r="medium"){let i=[r,...["short","medium","long"].filter(a=>a!==r)];for(let a of i){let s=this.cache.get(t,a);if(s)return s}return null}async cachedGet(t,r={},n="medium"){let i=this.cache.generateKey(t,r.params),a=this.getCachedResponse(i,n);if(a)return a;let s=`${n}:${i}`;return p2(`emby:${this.config.id}:${s}`,async()=>{try{let o=await this.retryRequest(c=>tt.get(t,{...r,signal:c}),this.config.retryCount||2);if(o.data){let u=JSON.stringify(o.data).length>1024*100?"long":n;this.cache.set(i,o,u),u!==n&&this.cache.set(i,o,n)}return o}catch(o){let c=this.getCachedResponse(i,n);if(c&&!o.response)return c;throw o}},(this.config.timeout||1e4)*((this.config.retryCount||2)+1)+2e3)}async post(t,r,n={}){return this.retryRequest(i=>tt.post(t,r,{...n,signal:i}),this.config.retryCount||1)}abortRequest(t){let r=this.abortControllers.get(t);r&&(r.abort(),this.abortControllers.delete(t))}sleep(t){return $t(t)}},TQe=class{constructor(t,r,n,i){this.config=t,this.requestManager=r,this.getHeaderProvider=n,this.urlBuilder=i,this.enablePlaybackReport=t.enablePlaybackReport!==!1,this.playSessions=new Map,this.heartbeatTimer=null,this.maxSessionDuration=7200*1e3,this.maxConcurrentReports=5,this.reportQueue=[]}startHeartbeat(){this.heartbeatTimer||!this.enablePlaybackReport||(this.heartbeatTimer=setInterval(()=>this.tick(),1e4))}stopHeartbeat(){this.heartbeatTimer&&(clearInterval(this.heartbeatTimer),this.heartbeatTimer=null)}async tick(){if(!this.enablePlaybackReport||this.playSessions.size===0){this.playSessions.size===0&&this.stopHeartbeat();return}let t=Date.now(),r=[];for(let[n,i]of this.playSessions.entries()){if(t-i.startTime>this.maxSessionDuration){this.playSessions.delete(n);continue}if(!i.isPaused&&t-i.lastReportTime>=3e4){let a=t-i.startTime-i.totalPausedDuration,s=i.initialPositionTicks+Math.floor(a/1e3)*1e7;if(i.positionTicks=s,i.lastReportTime=t,r.push(this.recordPlaybackProgress(n,s,!1)),r.length>=this.maxConcurrentReports)break}}r.length>0&&await Promise.allSettled(r)}async recordPlaybackStart(t,r,n=0){if(!this.enablePlaybackReport)return null;try{let i=await this.getHeaderProvider(),a=`js_${Date.now()}_${Math.floor(Math.random()*1e4)}`,s=n;if(!s)try{let u=this.urlBuilder(`/Users/${this.config.userId}/Items/${t}`),l=await this.requestManager.cachedGet(u,{headers:i,params:{Fields:"UserData"}},"short");l.data?.UserData&&(s=l.data.UserData.PlaybackPositionTicks||0)}catch(u){console.debug("\u83B7\u53D6\u7528\u6237\u6570\u636E\u5931\u8D25:",u.message)}let o={ItemId:t,MediaSourceId:r.Id||r.mediaSourceId,CanSeek:!0,IsPaused:!1,IsMuted:!1,PositionTicks:s,PlayMethod:"DirectStream",PlaySessionId:a,LiveStreamId:null,AudioStreamIndex:1,SubtitleStreamIndex:-1,VolumeLevel:100,PlaybackStartTimeTicks:Math.floor(Date.now()*1e4)},c=await this.requestManager.post(this.urlBuilder("/Sessions/Playing"),o,{headers:i,timeout:5e3}).catch(()=>null);if(c&&(c.status===200||c.status===204))return this.playSessions.set(a,{itemId:t,mediaSource:r,startTime:Date.now(),lastReportTime:Date.now(),initialPositionTicks:s,positionTicks:s,totalPausedDuration:0,isPaused:!1,lastPauseTime:0}),this.startHeartbeat(),a}catch(i){console.debug("\u64AD\u653E\u5F00\u59CB\u8BB0\u5F55\u5931\u8D25:",i.message)}return null}async recordPlaybackProgress(t,r,n=!1){if(!this.enablePlaybackReport||!this.playSessions.has(t))return!1;try{let i=this.playSessions.get(t),a=await this.getHeaderProvider();i.isPaused!==n&&(i.isPaused=n,n?i.lastPauseTime=Date.now():i.lastPauseTime>0&&(i.totalPausedDuration+=Date.now()-i.lastPauseTime,i.lastPauseTime=0)),r!==void 0&&(i.positionTicks=r);let s={ItemId:i.itemId,MediaSourceId:i.mediaSource.Id||i.mediaSource.mediaSourceId,PositionTicks:i.positionTicks,IsPaused:n,PlaySessionId:t,EventName:n?"pause":"timeupdate"},o=await this.requestManager.post(this.urlBuilder("/Sessions/Playing/Progress"),s,{headers:a,timeout:5e3}).catch(()=>null);if(o&&(o.status===200||o.status===204))return i.lastReportTime=Date.now(),!0}catch(i){console.debug("\u64AD\u653E\u8FDB\u5EA6\u8BB0\u5F55\u5931\u8D25:",i.message)}return!1}async recordPlaybackStop(t,r=null){if(!this.playSessions.has(t))return!1;try{let n=this.playSessions.get(t),i=await this.getHeaderProvider(),a;if(r!==null)a=r;else if(n.positionTicks!==void 0)a=n.positionTicks;else{let c=Date.now(),u=c-n.startTime;n.isPaused&&n.lastPauseTime>0&&(n.totalPausedDuration+=c-n.lastPauseTime),u-=n.totalPausedDuration;let l=Math.floor(u/1e3);a=n.initialPositionTicks+l*1e7}let s={ItemId:n.itemId,MediaSourceId:n.mediaSource.Id||n.mediaSource.mediaSourceId,PositionTicks:a,PlaySessionId:t},o=await this.requestManager.post(this.urlBuilder("/Sessions/Playing/Stopped"),s,{headers:i,timeout:5e3}).catch(()=>null);return this.playSessions.delete(t),this.playSessions.size===0&&this.stopHeartbeat(),o&&(o.status===200||o.status===204)}catch(n){this.playSessions.delete(t),this.playSessions.size===0&&this.stopHeartbeat(),console.debug("\u64AD\u653E\u505C\u6B62\u8BB0\u5F55\u5931\u8D25:",n.message)}return!1}async recordPlaybackPause(t,r){if(!this.enablePlaybackReport||!this.playSessions.has(t))return!1;try{let n=this.playSessions.get(t);return n.isPaused=!0,n.lastPauseTime=Date.now(),r!==void 0&&(n.positionTicks=r),await this.recordPlaybackProgress(t,r,!0)}catch(n){console.debug("\u64AD\u653E\u6682\u505C\u8BB0\u5F55\u5931\u8D25:",n.message)}return!1}async recordPlaybackUnpause(t,r){if(!this.enablePlaybackReport||!this.playSessions.has(t))return!1;try{let n=this.playSessions.get(t);return n.isPaused&&n.lastPauseTime>0&&(n.totalPausedDuration+=Date.now()-n.lastPauseTime),n.isPaused=!1,n.lastPauseTime=0,r!==void 0&&(n.positionTicks=r),await this.recordPlaybackProgress(t,r,!1)}catch(n){console.debug("\u64AD\u653E\u6062\u590D\u8BB0\u5F55\u5931\u8D25:",n.message)}return!1}async cleanupAllSessions(){let t=[];for(let r of this.playSessions.keys())t.push(this.recordPlaybackStop(r));return Promise.allSettled(t)}setEnablePlaybackReport(t){this.enablePlaybackReport=t,t||this.cleanupAllSessions()}getSession(t){return this.playSessions.get(t)}},vQe=(e,t,r,n=null,i=null)=>{let a=new URLSearchParams({UserId:i||e.userId,StartTimeTicks:"0",IsPlayback:"true",AutoOpenLiveStream:"true",MaxStreamingBitrate:"7000000","X-Emby-Client":e.client,"X-Emby-Device-Name":e.deviceName,"X-Emby-Device-Id":e.deviceId,"X-Emby-Client-Version":e.clientVersion,"X-Emby-Token":e.token,reqformat:"json"});return n&&a.set("MediaSourceId",n),`${t(`/Items/${r}/PlaybackInfo`)}?${a.toString()}`},Jmi=(e,t)=>t.DirectStreamUrl?t.DirectStreamUrl.startsWith("http")?t.DirectStreamUrl:e.server+t.DirectStreamUrl:t.Path&&t.Path.startsWith("http")?t.Path:e.isJellyfin?`${e.server}/Videos/${t.Id}/stream?static=true&api_key=${e.token}`:`${e.server}/emby/videos/${t.Id}/original?api_key=${e.token}&Static=true`;function g7r(e){let t={id:e.id,name:e.name||`Emby ${e.id.slice(0,8)}`,server:(e.server||"").replace(/\/$/,""),username:e.username||"",password:e.password||"",token:e.token||"",userId:e.userId||"",deviceId:e.deviceId||Wue.default.randomUUID(),deviceName:e.deviceName||"iPhone",client:e.client||"SenPlayer",clientVersion:e.clientVersion||"5.6.3",enablePlaybackReport:e.enablePlaybackReport!==!1,enabled:e.enabled!==!1,timeout:e.timeout||1e4,retryCount:e.retryCount||2,cacheViews:e.cacheViews!==!1,maxConcurrent:e.maxConcurrent||6,isJellyfin:e.isJellyfin||!1,serverType:e.isJellyfin?"jellyfin":"emby"},r=`/config/embyInstances/${t.id}`;function n(ce){let Z=t.isJellyfin?"":"/emby";return`${t.server}${Z}${ce}`}let i={"User-Agent":`${t.client}/${t.clientVersion}`,"X-Emby-Client":t.client,"X-Emby-Device-Name":t.deviceName,"X-Emby-Client-Version":t.clientVersion,"X-Emby-Device-Id":t.deviceId,...t.isJellyfin?{"X-Jellyfin-Client":t.client,"X-Jellyfin-Client-Version":t.clientVersion,"X-Jellyfin-Device-Id":t.deviceId,"X-Jellyfin-Device-Name":t.deviceName}:{}};async function a(){let ce={...i};if(t.token){let Z=`MediaBrowser Token="${t.token}", UserId="${t.userId}", Client="${t.client}", Device="${t.deviceName}", DeviceId="${t.deviceId}", Version="${t.clientVersion}"`;ce["X-Emby-Authorization"]=Z,ce["X-Emby-Token"]=t.token,t.isJellyfin&&(ce["X-Jellyfin-Token"]=t.token,ce["X-Jellyfin-Authorization"]=Z.replace("MediaBrowser","MediaBrowser"))}return ce}let s=new SQe(t),o=new TQe(t,s,a,n),c=["\u64AD\u653E\u5217\u8868","\u76F8\u673A","Playlists","Collections","Trailers","\u76F4\u64AD"],u=90,l=400,x=30,d=50,f=200,p=3e3;function m(ce){let Z=Number.parseInt(ce?.IndexNumber,10);return Number.isNaN(Z)?Number.MAX_SAFE_INTEGER:Z}function g(ce){if(!ce?.IndexNumber)return"";let Z=ce.Name||`\u7B2C${ce.IndexNumber||0}\u96C6`,ae=ce.MediaSources||[];if(ae.length>1){let H=ae.map((j,ne)=>{let O=j.Name||`\u7248\u672C${ne+1}`,U=`${ce.Id}|${j.Id}`;return`${O}$${U}`});return H.length>0?`${Z}@@${H.join("#")}`:""}if(ae.length===1){let H=ae[0],j=H.Name||Z,ne=`${ce.Id}|${H.Id}`;return`${j}$${ne}`}let fe=vQe(t,n,ce.Id,null,t.userId);return`${Z}$${fe}`}function h(ce){if(!Array.isArray(ce)||ce.length===0)return"";let Z=[],ae=[...ce].sort((fe,H)=>m(fe)-m(H));for(let fe of ae){let H=g(fe);H&&Z.push(H)}return Z.join("#")}function _(ce){let Z=Number.parseInt(ce,10);return Number.isNaN(Z)?Number.MAX_SAFE_INTEGER:Z}function y(ce){let Z=_(ce?.ParentIndexNumber),ae=ce?.SeasonName||(Z!==Number.MAX_SAFE_INTEGER?`\u7B2C${Z}\u5B63`:"\u7279\u522B\u7BC7"),fe=ce?.SeasonId||"";return{groupKey:fe||`idx_${Z}_${ae}`,seasonId:fe,seasonIndex:Z,seasonName:ae}}async function A(ce,Z,ae,fe="medium"){let H=[],j=0,ne=Number.MAX_SAFE_INTEGER;for(;j<ne&&H.length<p;){let O=await s.cachedGet(ce,{headers:ae,params:{...Z,Limit:f,StartIndex:j}},fe),U=O.data?.Items||[],$=Number.parseInt(O.data?.TotalRecordCount,10);if(Number.isNaN($)||(ne=$),U.length===0||(H.push(...U),U.length<f))break;j+=U.length}return H.slice(0,p)}async function v(ce,Z){let ae="Id,Name,IndexNumber,ParentIndexNumber,SeasonId,SeasonName,MediaSources",fe=n(`/Shows/${ce}/Episodes`);try{let j=await A(fe,{UserId:t.userId,Fields:ae,SortBy:"ParentIndexNumber,IndexNumber",SortOrder:"Ascending"},Z,"medium");if(j.length>0)return j}catch(j){console.debug("\u6309\u5267\u96C6\u63A5\u53E3\u83B7\u53D6\u5931\u8D25\uFF0C\u5C1D\u8BD5\u7528\u6237\u63A5\u53E3:",j.message)}let H=n(`/Users/${t.userId}/Items`);return A(H,{ParentId:ce,IncludeItemTypes:"Episode",Recursive:!0,Fields:ae,SortBy:"ParentIndexNumber,IndexNumber",SortOrder:"Ascending"},Z,"medium")}function S(){return!(!t.server||!t.token&&!t.username)}async function R(ce){if(!t.username||!t.server)return{success:!1,reason:"\u7F3A\u5C11\u767B\u5F55\u51ED\u8BC1"};let Z=t.isJellyfin?"/Users/AuthenticateByName":"/emby/Users/AuthenticateByName",ae=`${t.server}${Z}`,fe={Password:t.password||"",Pw:t.password||"",Username:t.username},H=`MediaBrowser Token="", UserId="", Client="${t.client}", Device="${t.deviceName}", DeviceId="${t.deviceId}", Version="${t.clientVersion}"`,j={Host:t.server.replace(/^https?:\/\//,"").replace(/\/$/,""),"Content-Type":"application/json","X-Emby-Authorization":H,Connection:"keep-alive",Accept:"*/*","User-Agent":`${t.client}/${t.clientVersion}`,"Accept-Language":"zh-CN,zh-Hans;q=0.9","Accept-Encoding":"gzip, deflate",...t.isJellyfin?{"X-Jellyfin-Authorization":H,"X-Jellyfin-Client":t.client,"X-Jellyfin-Device-Name":t.deviceName,"X-Jellyfin-Device-Id":t.deviceId,"X-Jellyfin-Client-Version":t.clientVersion}:{}};try{let ne=await tt.post(ae,fe,{headers:j,timeout:5e3});if(ne.data?.AccessToken)return t.token=ne.data.AccessToken,t.userId=ne.data.User.Id,ce?.server?.db&&await ce.server.db.push(r,{token:t.token,userId:t.userId,deviceId:t.deviceId,deviceName:t.deviceName,client:t.client,clientVersion:t.clientVersion}),{success:!0,token:t.token}}catch(ne){console.debug("SenPlayer\u683C\u5F0F\u767B\u5F55\u5931\u8D25:",ne.message);try{let U=`${t.server}/emby/Users/AuthenticateByName`,$={"Content-Type":"application/json","X-Emby-Client":t.client,"X-Emby-Device-Name":t.deviceName,"X-Emby-Device-Id":t.deviceId,"X-Emby-Client-Version":t.clientVersion,"User-Agent":"Mozilla/5.0"},V=await tt.post(U,fe,{headers:$,timeout:5e3});if(V.data?.AccessToken)return t.token=V.data.AccessToken,t.userId=V.data.User.Id,ce?.server?.db&&await ce.server.db.push(r,{token:t.token,userId:t.userId,deviceId:t.deviceId,deviceName:t.deviceName,client:t.client,clientVersion:t.clientVersion}),{success:!0,token:t.token}}catch(O){console.debug("Emby\u6807\u51C6\u683C\u5F0F\u767B\u5F55\u5931\u8D25:",O.message)}}return{success:!1,reason:"\u767B\u5F55\u5931\u8D25"}}async function w(ce){if(t.token&&t.userId)try{let Z=await a(),ae=n(`/Users/${t.userId}`);return await s.cachedGet(ae,{headers:Z},"short"),!0}catch(Z){Z.response?.status}return(await R(ce)).success}async function C(){try{let ce=await a();return!!(await s.cachedGet(n("/System/Info"),{headers:ce},"short")).data}catch{return!1}}function N(ce,Z,ae={}){if(!Z)return"";let{maxWidth:fe=l,quality:H=u,imageType:j="Primary"}=ae,ne=`/Items/${ce}/Images/${j}`,O=`?maxWidth=${fe}&tag=${Z}&quality=${H}`;return t.isJellyfin?`${t.server}${ne}${O}`:`${t.server}/emby${ne}${O}`}function k(ce){let Z=String(ce?.headers?.["x-forwarded-proto"]||ce?.protocol||"http").split(",")[0].trim()||"http",ae=String(ce?.headers?.["x-forwarded-host"]||ce?.headers?.host||"").split(",")[0].trim();return ae?`${Z}://${ae}`:""}function P(ce,Z,ae={},fe=null){if(!Z)return"";let{maxWidth:H=l,quality:j=u,imageType:ne="Primary"}=ae,O=k(fe);if(!O)return N(ce,Z,ae);let U=new URL(`${O}/spider/emby_${t.id}/3/proxy/image`);return U.searchParams.set("itemId",String(ce||"")),U.searchParams.set("tag",String(Z||"")),U.searchParams.set("imageType",String(ne||"Primary")),U.searchParams.set("maxWidth",String(H)),U.searchParams.set("quality",String(j)),U.toString()}async function L(ce,Z){if(!await w(ce))return Z.code(401).send("\u767B\u5F55\u5931\u8D25");let ae=String(ce?.query?.itemId||"").trim(),fe=String(ce?.query?.tag||"").trim(),H=String(ce?.query?.imageType||"Primary").trim()||"Primary",j=Math.max(1,Number.parseInt(ce?.query?.maxWidth,10)||l),ne=Math.max(1,Number.parseInt(ce?.query?.quality,10)||u);if(!ae||!fe)return Z.code(400).send("missing image params");try{let O=await a(),U=N(ae,fe,{maxWidth:j,quality:ne,imageType:H}),$=await tt.get(U,{headers:{...O,Accept:"image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"},responseType:"stream",timeout:t.timeout||1e4,validateStatus:()=>!0});return($.status||500)>=400||!$.data?Z.code($.status||502).send("fetch image failed"):($.headers["content-type"]&&Z.header("Content-Type",$.headers["content-type"]),$.headers["content-length"]&&Z.header("Content-Length",$.headers["content-length"]),Z.header("Access-Control-Allow-Origin","*"),Z.header("Cache-Control","public, max-age=300"),Z.send($.data))}catch{return Z.code(502).send("proxy image error")}}async function F(ce,Z){try{if(!S())return{success:!1,error:"\u914D\u7F6E\u4E0D\u5B8C\u6574"};if(ce?.server?.db){let ae=await ce.server.db.getObjectDefault(r,{});ae?.deviceId&&Object.assign(t,ae)}return(!t.token||!t.userId)&&!await w(ce)?{success:!1,error:"\u767B\u5F55\u5931\u8D25"}:{success:!0,name:t.name,server:t.server,serverType:t.serverType}}catch(ae){return{success:!1,error:ae.message}}}async function Q(ce,Z){let ae=kr("emby",{...arguments[0],cacheKeyExtra:t.id}),fe=Pr(ae);if(fe)return fe;if(!await w(ce))return{class:[],error:"\u767B\u5F55\u5931\u8D25"};try{let H=await a(),j=n(`/Users/${t.userId}/Views`),ne=t.cacheViews?"long":"short",U=(await s.cachedGet(j,{headers:H},ne)).data.Items||[],$=[],V={};U.filter(G=>!c.some(ee=>G.Name.includes(ee))).forEach(G=>{let ee=G.Id.toString();$.push({type_id:ee,type_name:G.Name,type_image:P(G.Id,G.ImageTags?.Primary,{maxWidth:200,imageType:"Thumb"},ce)});let Y=[{n:"\u6700\u8FD1\u6DFB\u52A0",v:"dateadded"},{n:"\u6700\u8FD1\u53D1\u884C",v:"premieredate_desc"},{n:"\u6700\u8FD1\u64AD\u653E",v:"dateplayed"},{n:"\u5E74\u4EFD\u65B0\u2192\u65E7",v:"year_desc"},{n:"\u5E74\u4EFD\u65E7\u2192\u65B0",v:"year_asc"},{n:"\u8BC4\u5206\u6700\u9AD8",v:"rating"},{n:"\u540D\u79F0A\u2192Z",v:"name"}],J=[{n:"\u5168\u90E8",v:""},{n:"2026",v:"2026"}];for(let te=2025;te>=2010;te--)J.push({n:String(te),v:String(te)});let q=[{n:"\u5168\u90E8",v:""},..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map(te=>({n:te,v:te}))];V[ee]=[{key:"tid",name:"\u6392\u5E8F",init:"dateadded",value:Y},{key:"year",name:"\u5E74\u4EFD",init:"",value:J},{key:"letter",name:"\u5B57\u6BCD",init:"",value:q}]});let K={class:$,filters:V};return Lr(ae,K,Ut.semiStatic),K}catch{return{class:[],error:"\u83B7\u53D6\u9996\u9875\u5931\u8D25"}}}async function z(ce,Z){let ae=ce.body.id,fe=parseInt(ce.body.page,10)||1;fe<1&&(fe=1);let H=x,j=(fe-1)*H;if(!await w(ce))return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let ne=await a(),O=n(`/Users/${t.userId}/Items`),U=ce.body.filters||{},$=U.tid||"dateadded",V=U.year||"",K=U.letter||"",G={dateadded:{sortBy:"DateCreated,SortName",sortOrder:"Descending"},premieredate_desc:{sortBy:"PremiereDate,SortName",sortOrder:"Descending"},dateplayed:{sortBy:"DatePlayed,SortName",sortOrder:"Descending"},year_asc:{sortBy:"ProductionYear,SortName",sortOrder:"Ascending"},year_desc:{sortBy:"ProductionYear,SortName",sortOrder:"Descending"},rating:{sortBy:"CommunityRating,SortName",sortOrder:"Descending"},name:{sortBy:"SortName",sortOrder:"Ascending"}},{sortBy:ee,sortOrder:Y}=G[$]||G.dateadded,J={SortBy:ee,SortOrder:Y,ParentId:ae,Recursive:"true",Limit:H,StartIndex:j,Fields:"ProductionYear,Status,DateCreated,CommunityRating,PremiereDate",IncludeItemTypes:"Movie,Series",ImageTypeLimit:1,EnableImageTypes:"Primary,Backdrop",EnableUserData:"true"};if(V){let Ie=parseInt(V,10);isNaN(Ie)||(J.Years=Ie.toString())}K&&(J.NameStartsWith=K);let q=await s.cachedGet(O,{headers:ne,params:J},"medium"),te=q.data.Items||[],le=q.data.TotalRecordCount||0,ye=te.map(Ie=>{let $e=Ie.CommunityRating?`\u2B50${Ie.CommunityRating.toFixed(1)}`:"",Ve=Ie.ProductionYear||"",De=[$e,Ve].filter(Boolean).join(" ");return{vod_id:Xmi(Ie.Id,{vod_pic:P(Ie.Id,Ie.ImageTags?.Primary,{},ce),vod_remarks:De}),vod_name:Ie.Name,vod_pic:P(Ie.Id,Ie.ImageTags?.Primary,{},ce),vod_remarks:De,vod_year:Ve,vod_score:Ie.CommunityRating||0}}),Te=Math.ceil(le/H);return{list:ye,page:fe,pagecount:Te,limit:H,total:le}}catch{return{list:[],error:"\u83B7\u53D6\u5206\u7C7B\u5931\u8D25"}}}async function re(ce,Z){let ae=Qmi(ce.body.id),fe=ae.id;if(!await w(ce))return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let H=await a(),j=n(`/Users/${t.userId}/Items/${fe}`),O=(await s.cachedGet(j,{headers:H,params:{Fields:"MediaSources,Overview,Genres,ProductionYear,OfficialRating,RunTimeTicks,People,Studios,Taglines,Type"}},"long")).data,U={vod_id:O.Id,vod_name:O.Name,vod_pic:ae.meta?.vod_pic||P(O.Id,O.ImageTags?.Primary,{},ce),vod_type:O.Genres?.join(",")||"",vod_year:O.ProductionYear||"",vod_area:O.ProductionLocation||"",vod_actor:O.People?.filter(K=>K.Type==="Actor").map(K=>K.Name).join(",")||"",vod_director:O.People?.filter(K=>K.Type==="Director").map(K=>K.Name).join(",")||"",vod_content:(O.Overview||"").replace(/\r\n/g," "),vod_remarks:ae.meta?.vod_remarks||O.OfficialRating||"",vod_play_from:"",vod_play_url:""},$=[],V=[];if(O.Type==="Series")try{let K=[];try{let q=n(`/Shows/${fe}/Seasons`);K=(await s.cachedGet(q,{headers:H,params:{UserId:t.userId,Fields:"Id,Name,IndexNumber",EnableTotalRecordCount:!1}},"long")).data?.Items||[]}catch(q){console.debug("\u83B7\u53D6\u5B63\u5217\u8868\u5931\u8D25\uFF0C\u7EE7\u7EED\u5C1D\u8BD5\u6279\u91CF\u83B7\u53D6\u5267\u96C6:",q.message)}let G=await v(fe,H),ee=new Map;for(let q of G){let te=y(q);ee.has(te.groupKey)||ee.set(te.groupKey,{...te,episodes:[]}),ee.get(te.groupKey).episodes.push(q)}let Y=[...K].sort((q,te)=>_(q?.IndexNumber)-_(te?.IndexNumber));for(let q of Y){let te=q?.Id||"",le=te?ee.get(te):null;if(!le||le.episodes.length===0)continue;let ye=h(le.episodes);ye&&($.push(q.Name||le.seasonName||`Season ${q.IndexNumber||te}`),V.push(ye),ee.delete(te))}let J=[...ee.values()].sort((q,te)=>q.seasonIndex!==te.seasonIndex?q.seasonIndex-te.seasonIndex:(q.seasonName||"").localeCompare(te.seasonName||""));for(let q of J){if(!q.episodes||q.episodes.length===0)continue;let te=h(q.episodes);te&&($.push(q.seasonName||t.name),V.push(te))}}catch(K){console.debug("\u83B7\u53D6\u5267\u96C6\u4FE1\u606F\u5931\u8D25:",K.message)}else{let K=O.MediaSources||[];if(K.length>0)K.forEach(G=>{let ee=G.Name||"\u9ED8\u8BA4\u7EBF\u8DEF";$.push(ee);let Y=vQe(t,n,fe,G.Id,t.userId);V.push(`${O.Name}$${Y}`)});else{$.push(t.name);let G=vQe(t,n,fe,null,t.userId);V.push(`${O.Name}$${G}`)}}return $.length===0||V.length===0?{list:[],error:"\u65E0\u6CD5\u83B7\u53D6\u64AD\u653E\u5217\u8868"}:(U.vod_play_from=$.join("$$$"),U.vod_play_url=V.join("$$$"),{list:[U]})}catch(H){return console.debug("\u83B7\u53D6\u8BE6\u60C5\u5931\u8D25:",H.message),{list:[],error:"\u83B7\u53D6\u8BE6\u60C5\u5931\u8D25"}}}async function se(ce,Z){let ae=ce.body.wd?.trim();if(!ae)return{list:[]};if(!await w(ce))return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let fe=await a(),H=n(`/Users/${t.userId}/Items`),j={SearchTerm:ae,IncludeItemTypes:"Movie,Series",Recursive:"true",Limit:d,Fields:"ProductionYear,Type",EnableImageTypes:"Primary",SortBy:"SortName",SortOrder:"Ascending"};return{list:((await s.cachedGet(H,{headers:fe,params:j},"short")).data.Items||[]).map($=>({vod_id:$.Id,vod_name:$.Name,vod_pic:P($.Id,$.ImageTags?.Primary,{},ce),vod_remarks:$.Type==="Series"?"\u5267\u96C6":"\u7535\u5F71",vod_year:$.ProductionYear||""}))}}catch{return{list:[],error:"\u641C\u7D22\u5931\u8D25"}}}async function ie(ce,Z){let ae=String(ce.body?.id||"");if(!ae)return{parse:1,url:"",header:i};if(ae.endsWith("_more")){let j=ae.replace("_more","");return{parse:0,url:`${t.server}/web/index.html#!/details?id=${j}&serverId=${t.server}`,header:i}}let fe,H;if(ae.includes("|")){let j=ae.split("|");fe=j[0],H=j[1]}else if(ae.includes("/PlaybackInfo?"))try{let j=new URL(ae),ne=j.pathname.split("/");fe=ne[ne.length-2],H=j.searchParams.get("MediaSourceId")}catch{return{parse:1,url:ae,header:i}}else return{parse:1,url:ae,header:i};try{let j=await a(),ne={DeviceProfile:{MaxStreamingBitrate:14e7,DirectPlayProfiles:[{Container:"mp4,mkv,m4v",Type:"Video"}]}},O=n(`/Items/${fe}/PlaybackInfo`),U={UserId:t.userId,MaxStreamingBitrate:14e7};H&&(U.MediaSourceId=H);let V=(await tt.post(O,ne,{headers:{...j,"Content-Type":"application/json"},params:U,timeout:5e3})).data?.MediaSources||[];if(V.length===0)return{error:"\u65E0\u53EF\u7528\u5A92\u4F53\u6E90"};let K=V.find(J=>J.Id===H)||V[0],G=null;t.enablePlaybackReport&&o.recordPlaybackStart(fe,K).then(J=>{G=J}).catch(()=>{});let ee=de(K,G);return ee||{parse:0,url:Jmi(t,K),header:i,extra:{mediaSourceId:K.Id,playbackSessionId:G}}}catch(j){return console.debug("\u64AD\u653E\u8BF7\u6C42\u5931\u8D25:",j.message),{parse:0,url:t.isJellyfin?`${t.server}/Videos/${fe}/stream?api_key=${t.token}`:`${t.server}/emby/videos/${fe}/stream?api_key=${t.token}`,header:i}}}function de(ce,Z){return ce.DirectStreamUrl?{parse:0,url:ce.DirectStreamUrl.startsWith("http")?ce.DirectStreamUrl:t.server+ce.DirectStreamUrl,header:{...i,Referer:`${t.server}/`,...Z&&{"X-Playback-Session-Id":Z}},extra:{source:ce.Name||"\u9ED8\u8BA4",bitrate:ce.Bitrate?`${(ce.Bitrate/1e6).toFixed(1)}M`:"",mediaSourceId:ce.Id,playbackSessionId:Z}}:ce.Path&&ce.Path.startsWith("http")?{parse:0,url:ce.Path,header:i,extra:{mediaSourceId:ce.Id,playbackSessionId:Z}}:null}return{meta:{key:`emby_${t.id}`,name:`${t.isJellyfin?"Jellyfin":"Emby"} ${t.name}`,type:3,version:"0.0.3"},api:async ce=>{ce.get("/proxy/image",L),ce.post("/init",F),ce.post("/home",Q),ce.post("/category",z),ce.post("/detail",re),ce.post("/play",ie),ce.post("/search",se)}}}br();On();au();ko();var wQe="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",Yue=3e4,Zmi=1e4,ehi=new Set(["desktop.ini","thumbs.db","readme.md"]),RQe=1e3,thi=5e3,rhi=/\.(mp4|mkv|avi|mov|flv|wmv|m3u8|ts|rmvb|webm|m4v|mpg|mpeg|3gp|iso)$/i,nhi="https://img.icons8.com/color/48/folder-invoices.png",ihi="https://img.icons8.com/fluency/96/video-file.png",ahi="",y7r="__alist_playlist__",_7r="https://img.icons8.com/fluency/96/playlist.png",shi={mp4:"video/mp4",m4v:"video/mp4",mkv:"video/x-matroska",avi:"video/x-msvideo",mov:"video/quicktime",flv:"video/x-flv",wmv:"video/x-ms-wmv",m3u8:"application/vnd.apple.mpegurl",ts:"video/MP2T",webm:"video/webm",mpg:"video/mpeg",mpeg:"video/mpeg","3gp":"video/3gpp"},ohi={srt:"text/plain; charset=utf-8",ass:"text/plain; charset=utf-8",ssa:"text/plain; charset=utf-8",sub:"text/plain; charset=utf-8",idx:"text/plain; charset=utf-8",smi:"text/plain; charset=utf-8",txt:"text/plain; charset=utf-8",vtt:"text/vtt; charset=utf-8"};function chi(e="",t=""){let r=String(e),n=String(t),i=r.match(/(\d+|\D+)/g)||[],a=n.match(/(\d+|\D+)/g)||[],s=Math.min(i.length,a.length);for(let o=0;o<s;o++){let c=i[o],u=a[o],l=/^\d+$/.test(c),x=/^\d+$/.test(u);if(l&&x){let f=Number(c)-Number(u);if(f!==0)return f;continue}let d=c.localeCompare(u);if(d!==0)return d}return i.length-a.length||r.localeCompare(n)}function uhi(){try{if(typeof Intl<"u"&&Intl&&typeof Intl.Collator=="function"){let e=new Intl.Collator("zh-Hans-CN",{numeric:!0,sensitivity:"base"});return(t,r)=>e.compare(t,r)}}catch{}return chi}var A7r=uhi();function Xue(e=""){try{return decodeURIComponent(e)}catch{return e}}function Que(e=""){let r=String(e).trim().replace(/[?#].*$/,"").replace(/\/+$/,"").split("/").filter(Boolean);return r.length>0?r[r.length-1]:""}function lhi(e="",t=""){let r=Xue(String(e).trim()),n=Xue(String(t).trim()),i=Que(r);if(i)return i;let a=Que(n);return a||r||n||"\u672A\u77E5\u89C6\u9891"}function b7r(e=""){return Buffer.from(String(e),"utf8").toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"")}function v7r(e=""){let t=String(e||"").replace(/-/g,"+").replace(/_/g,"/"),r=t+"=".repeat((4-t.length%4)%4);return Buffer.from(r,"base64").toString("utf8")}function E7r(e){let t=String(e?.headers?.["x-forwarded-proto"]||e?.protocol||"http").split(",")[0].trim()||"http",r=String(e?.headers?.["x-forwarded-host"]||e?.headers?.host||"").split(",")[0].trim();return r?`${t}://${r}`:e?.server?.address?.()?.url||""}function S7r(e){return String(e?.server?.prefix||"").replace(/\/+$/,"")}function T7r(e=""){let t=String(e||"").toLowerCase().match(/\.([a-z0-9]+)(?:[?#].*)?$/);return t?t[1]:""}function xhi(e=""){return shi[T7r(e)]||"application/octet-stream"}function w7r(e){let t=String(e.id||"unknown"),r=(e.server||"").replace(/\/$/,"");r=r.replace(/:443$/,"").replace(/(:443)\//,"/"),r=r.replace(/^http:\/\/([^:\/]+):80$/,"http://$1"),r=r.replace(/^http:\/\/([^:\/]+):80\//,"http://$1/");let n={id:t,name:e.name||`Alist ${t.slice(0,8)}`,server:r,username:e.username||"",password:e.password||"",token:e.token||"",enabled:e.enabled!==!1},i=n.server,a=null;function s(H,j="",ne={}){return JSON.stringify({c:n.id,p:H||"",n:j,...ne})}function o(H){try{return JSON.parse(H)}catch{return{c:n.id,p:H||"/",n:""}}}function c(){let H={"Content-Type":"application/json","User-Agent":wQe};return n.token&&(H.Authorization=n.token),H}async function u(){if(!n.username)return null;if(a)return a;a=(async()=>{try{let H=await tt.post(`${i}/api/auth/login`,{username:n.username,password:n.password||""},{timeout:Yue});if(H.data?.code===200&&H.data?.data?.token)return n.token=H.data.data.token,n.token;console.error(`[Alist\u767B\u5F55] \u767B\u5F55\u5931\u8D25: ${n.name}, \u54CD\u5E94\u7801: ${H.data?.code}`)}catch(H){console.error(`[Alist\u767B\u5F55] \u767B\u5F55\u5F02\u5E38: ${n.name}, \u9519\u8BEF: ${H.message}`)}return null})();try{return await a}finally{a=null}}function l(H,j){let ne=H?.data?.code||j?.response?.status,O=String(H?.data?.message||j?.response?.data?.message||"").toLowerCase();return ne===401||ne===403||O.includes("token")||O.includes("unauthorized")}async function x(H,j){let ne=()=>tt.post(`${i}${H}`,j,{headers:c(),timeout:Yue});try{let O=await ne();return l(O,null)&&n.username&&await u()?await ne():O}catch(O){if(n.username&&l(null,O)&&await u())return await ne();throw O}}async function d(){return n.token?!0:n.username?!!await u():!0}async function f(H,j=1,ne=RQe,O={}){let U=Math.max(1,Number.parseInt(j,10)||1),$=Math.min(RQe,Math.max(1,Number.parseInt(ne,10)||RQe)),V=Math.max($,Number.parseInt(O.maxItems,10)||thi),K=[],G=U,ee=0;try{for(;K.length<V;){let Y=await x("/api/fs/list",{path:H||"/",password:"",page:G,per_page:$,refresh:!1});if(Y.data?.code!==200){console.error(`[Alist\u5217\u8868] \u5931\u8D25: ${H}, \u54CD\u5E94\u7801: ${Y.data?.code}, \u6D88\u606F: ${Y.data?.message}`);break}let J=Y.data.data||{},q=Array.isArray(J.content)?J.content:[];if(ee=Number(J.total||J.count||ee||0),K.push(...q),q.length<$||ee>0&&K.length>=ee)break;G+=1}}catch(Y){console.error(`[Alist\u5217\u8868] \u5F02\u5E38: ${H}, \u9519\u8BEF: ${Y.message}`)}return K.slice(0,V)}async function p(H){try{let j=await x("/api/fs/get",{path:H||"/",password:""});if(j.data?.code===200)return j.data.data;console.error(`[Alist\u6587\u4EF6] \u5931\u8D25: ${H}, \u54CD\u5E94\u7801: ${j.data?.code}, \u6D88\u606F: ${j.data?.message}`)}catch(j){console.error(`[Alist\u6587\u4EF6] \u5F02\u5E38: ${H}, \u9519\u8BEF: ${j.message}`)}return null}function m(H){if(!H)return"";let O=(H.startsWith("/")?H:`/${H}`).split("/").map(U=>U===""?"":encodeURIComponent(U).replace(/%2F/g,"/")).join("/");return`${i}/d${O}`}function g(H,j,ne){let O=b7r(JSON.stringify({c:n.id,p:j||"",n:ne||""})),U=T7r(ne),$=`${S7r(H)}/proxy/media/${O}${U?`.${U}`:""}`,V=E7r(H);return V?`${V}${$}`:$}function h(H=""){let j=S(H);return ohi[j]||"text/plain; charset=utf-8"}function _(H,j,ne,O=""){let U=S(O||ne),$=b7r(JSON.stringify({c:n.id,p:j||"",n:ne||"",f:U})),V=`${S7r(H)}/proxy/subtitle/${$}.${U}`,K=E7r(H);return K?`${K}${V}`:V}function y(H,j){let ne=String(H||"/");return ne==="/"?`/${j}`:`${ne}/${j}`}function A(H){return!!H&&rhi.test(H)}function v(H){return Yt(H)}function S(H){return ur(H)||String(H||"").toLowerCase().replace(/^\./,"")||"srt"}function R(H){return String(H||"\u64AD\u653E").replace(/\.[^.]+$/,"").replace(/<|>|《|》/g,"").replace(/\$|#/g," ").trim()||"\u64AD\u653E"}function w(H,j=0){let ne=Number(j||0);return ne>0?`${R(H)}  [${F(ne)}]`:R(H)}function C(H){return String(H||"/").split("/").filter(Boolean).pop()||"\u6839\u76EE\u5F55"}function N(H){let j=Array.isArray(H)?H.filter(O=>O?.url).map(O=>({url:O.url,name:O.name||"\u5916\u6302\u5B57\u5E55",format:S(O.format||O.name)})):[];if(j.length===0)return{};let ne=j[0];return{subt:ne.url,subtitle:ne.url,subs_urls:j.map(O=>O.url),subs:j,extra:{subt:ne.url,subtitle:ne.url,subs_urls:j.map(O=>O.url),subs:j}}}function k(H,j){let O=(Array.isArray(H)?H:H?[H]:[]).map(U=>{let $=U?.name||"",V=U?.path||(j==="/"?`/${$}`:`${j}/${$}`);return!$||!V?null:{p:V,n:$,e:S($)}}).filter(Boolean);return O.length===0?{}:{ss:O}}function P(H,j,ne,O,U=0){return s(H,j,{...k(ne,O),s:Number(U||0)})}async function L(H){let j=await p(H);return j&&j.raw_url?{fileInfo:j,url:j.raw_url,urlSource:"raw_url"}:j&&j.url?{fileInfo:j,url:j.url,urlSource:"url"}:{fileInfo:j,url:m(H),urlSource:"direct_link"}}function F(H){if(!H||H===0)return"0B";let j=1024,ne=["B","KB","MB","GB","TB"],O=Math.floor(Math.log(H)/Math.log(j));return parseFloat((H/Math.pow(j,O)).toFixed(2))+ne[O]}async function Q(H,j){try{if(!n.server)return{success:!1,error:"\u670D\u52A1\u5668\u5730\u5740\u672A\u914D\u7F6E"};if(n.username&&!n.token&&!await d())return{success:!1,error:"\u767B\u5F55\u5931\u8D25"};let ne=await x("/api/fs/list",{path:"/",password:"",page:1,per_page:1});return ne.data?.code!==200?{success:!1,error:ne.data?.message||"\u8FDE\u63A5\u6821\u9A8C\u5931\u8D25",message:`\u8FDE\u63A5\u5931\u8D25: ${ne.data?.message||"\u8FDE\u63A5\u6821\u9A8C\u5931\u8D25"}`}:{success:!0,name:n.name,message:`\u8FDE\u63A5\u6210\u529F: ${n.name}`}}catch(ne){return{success:!1,error:ne.message,message:`\u8FDE\u63A5\u5931\u8D25: ${ne.message}`}}}async function z(H,j){let ne=kr("alist",arguments[0]||{}),O=Pr(ne);if(O)return O;let U={class:[{type_id:s("/",""),type_name:n.name,type_flag:"alist"}],filters:{}};return Lr(ne,U,Ut.semiStatic),U}async function re(H,j){let ne=H.body||{},O="/",U=null;ne.id&&(U=o(ne.id),O=U.p||"/");let $=parseInt(ne.page)||1,V=50;if(!await d())return{page:1,pagecount:1,limit:V,total:0,list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let G=(await f(O,1,1e3)).filter(De=>{let Be=De?.name||"";return Be&&!Be.startsWith(".")&&!ehi.has(Be.toLowerCase())}),ee=[],Y=[],J=[];G.forEach(De=>{let Be=y(O,De.name);De.is_dir?ee.push({...De,path:Be,type:"folder"}):(Y.push({...De,path:Be,type:"file",isVideo:A(De.name)}),v(De.name)&&J.push({...De,path:Be}))}),ee.sort((De,Be)=>A7r(De.name,Be.name));let q=Rr(Y.filter(De=>De.isVideo)),te=new Set(q.map(De=>De.path)),le=Y.filter(De=>!te.has(De.path)).sort((De,Be)=>A7r(De.name,Be.name)),ye=[...ee];q.length>1&&ye.push({isPlaylist:!0,path:O,name:"\u64AD\u653E\u5217\u8868",count:q.length}),ye.push(...q,...le);let Te=($-1)*V,Ie=Te+V,Ve=ye.slice(Te,Ie).map(De=>{if(De.isPlaylist){let Be=s(De.path,y7r,{t:`${C(De.path)} \u64AD\u653E\u5217\u8868`});return{vod_id:Be,vod_name:"\u64AD\u653E\u5217\u8868",vod_pic:_7r,vod_remarks:`${De.count}\u4E2A\u89C6\u9891`,vod_tag:"playlist",vod_content:"",extend:{id:Be,path:De.path,type:"playlist"}}}if(De.is_dir){let Be=s(De.path,"");return{vod_id:Be,type_id:Be,type_name:De.name,vod_name:`\u{1F4C1} ${De.name}`,vod_pic:"https://img.icons8.com/color/48/folder-invoices.png",vod_remarks:"\u6587\u4EF6\u5939",vod_tag:"folder",vod_content:"",cate:{id:Be,name:De.name},extend:{id:Be,path:De.path,type:"folder"}}}else{let Be=De.isVideo?fo(De.name,J,ve=>ve?.name||""):[],we=P(De.path,De.name,Be,O,De.size),ge=[];return De.isVideo&&ge.push("\u{1F3AC}"),De.size&&ge.push(F(De.size)),{vod_id:we,vod_name:De.name,vod_pic:De.thumb||"",vod_remarks:ge.join(" "),vod_tag:De.isVideo?"video":"file",vod_content:"",extend:{id:we,path:De.path,type:"file",isVideo:De.isVideo}}}});return{page:$,pagecount:Math.max(1,Math.ceil(ye.length/V)),limit:V,total:ye.length,list:Ve}}catch(K){return console.error("Alist\u5206\u7C7B\u5931\u8D25:",K),{page:1,pagecount:1,limit:V,total:0,list:[],error:K.message}}}async function se(H,j){let ne=H.body||{};if(!ne.id)return{list:[],error:"ID\u53C2\u6570\u7F3A\u5931"};if(!await d())return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let O=o(ne.id);if(!O.n)return{list:[],error:"\u76EE\u5F55\u65E0\u6CD5\u67E5\u770B\u8BE6\u60C5\uFF0C\u8BF7\u4F7F\u7528\u5206\u7C7B\u6D4F\u89C8"};let U=O.p;if(O.n===y7r){let V=await f(U),K=V.filter(Y=>!Y.is_dir&&v(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})),G=Rr(V.filter(Y=>!Y.is_dir&&A(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})));if(G.length===0)return{list:[],error:"\u6587\u4EF6\u5939\u4E2D\u6CA1\u6709\u89C6\u9891\u6587\u4EF6"};let ee=G.map(Y=>{let J=fo(Y.name,K,te=>te?.name||""),q=P(Y.path,Y.name,J,U,Y.size);return`${w(Y.name,Y.size)}$${q}`}).join("#");return{list:[{vod_id:ne.id,vod_name:O.t||`${C(U)} \u64AD\u653E\u5217\u8868`,vod_pic:_7r,vod_content:`\u5F53\u524D\u76EE\u5F55: ${U}`,vod_remarks:`\u5171${G.length}\u4E2A\u89C6\u9891`,vod_play_from:n.name,vod_play_url:ee}]}}let $=await p(U);if(!$)return{list:[],error:"\u6587\u4EF6\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u8BBF\u95EE"};if($.is_dir){let V=await f(U),K=V.filter(Y=>!Y.is_dir&&v(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})),G=Rr(V.filter(Y=>!Y.is_dir&&A(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})));if(G.length===0)return{list:[],error:"\u6587\u4EF6\u5939\u4E2D\u6CA1\u6709\u89C6\u9891\u6587\u4EF6"};let ee=G.map(Y=>{let J=fo(Y.name,K,te=>te?.name||""),q=P(Y.path,Y.name,J,O.p,Y.size);return`${w(Y.name,Y.size)}$${q}`}).join("#");return{list:[{vod_id:ne.id,vod_name:O.n,vod_pic:$.thumb||"",vod_content:"",vod_remarks:F($.size)||"",vod_play_from:n.name,vod_play_url:ee}]}}else{if(!A($.name))return{list:[],error:"\u4E0D\u662F\u89C6\u9891\u6587\u4EF6"};let V=U.substring(0,U.lastIndexOf("/"))||"/",G=(await f(V)).filter(q=>!q.is_dir&&v(q.name)).map(q=>({...q,path:y(V,q.name)})),ee=fo(O.n,G,q=>q?.name||""),Y=P(U,O.n,ee,V,$.size),J="";return ee.length>0&&(J=`\u5B57\u5E55\u6587\u4EF6:
+`)}function jmi(e){let t=String(e||"").match(/(?:^|\/)core\/([A-Za-z0-9_-]+)\.js$/);if(t)return{key:t[1],type:"core"};let r=String(e||"").match(/(?:^|\/)util\/([A-Za-z0-9_-]+)\.js$/);return r?{key:r[1],type:"util"}:Object.prototype.hasOwnProperty.call(AQe,e)?{key:e,type:"package"}:null}function Vmi(e){let t=[],r=/import\s+(?:[^;]*?\s+from\s+)?(['"])([^'"]+)\1\s*;?/g,n=null;for(;(n=r.exec(e))!==null;)t.push(n[2]);return t}function Hmi(e){return e.startsWith("./")||e.startsWith("../")}async function zmi(e,t){let r=Wd.default.resolve(Wd.default.dirname(e),t),n=Wd.default.extname(r)?[r]:[r,`${r}.js`,Wd.default.join(r,"index.js")];for(let i of n)try{return await que.default.access(i),!0}catch{}return!1}async function Kmi(e,t){if(Wd.default.normalize(e).includes(Umi))return!0;let r=Vmi(t);for(let n of r)if(Hmi(n)&&await zmi(e,n))return!0;return!1}async function qmi(e){let t=await que.default.stat(e),r=(0,Gue.pathToFileURL)(e);return r.searchParams.set("mtime",String(Math.floor(t.mtimeMs))),await import(r.href)}function Gmi(e,t){let r=/import\s+([^;]*?)\s+from\s+(['"])([^'"]+)\2\s*;?/g,n=new Set,i=e.replace(r,(a,s,o,c)=>{let u=jmi(c);return u?Object.prototype.hasOwnProperty.call(AQe,u.key)?$mi(s,u.key):((u.type==="util"||u.type==="core")&&n.add(`${u.type}/${u.key}.js`),a):a});return n.size&&console.error(`[js] ${t}: \u4E0A\u4F20\u811A\u672C\u4F9D\u8D56\u672A\u5185\u7F6E\u7684\u6A21\u5757 ${[...n].join("\u3001")}\uFF1B\u8BBE\u5907 bundle \u65E0 src/ \u6E90\u7801\u6811\uFF0C\u9700\u5728 src/spider/video/js.js \u7684 JS_IMPORT_REGISTRY \u8865\u5145\u5BFC\u51FA\u540E\u91CD\u65B0\u6253\u5305\u3002`),(/\brequire\s*\(/.test(i)&&!/\b(?:const|let|var|function)\s+require\b/.test(i)?(globalThis.__lmRequireHeader||""):"")+i}async function Wmi(e,t){let r=e.path||e.file,n=Fmi(r),i=await que.default.readFile(n,"utf8");if(await Kmi(n,i)){let u=await qmi(n),l=u.default||u;if(!l)throw new Error("JS \u6A21\u5757\u6CA1\u6709\u53EF\u7528\u5BFC\u51FA");return l}let a=Gmi(i,t),o=await import("data:text/javascript;charset=utf-8,"+encodeURIComponent(a)),c=o.default||o;if(!c)throw new Error("JS \u6A21\u5757\u6CA1\u6709\u53EF\u7528\u5BFC\u51FA");return c}function Ymi(e,t){if(!e||typeof e!="object")throw new Error("JS \u6A21\u5757\u5BFC\u51FA\u503C\u4E0D\u662F spider \u5BF9\u8C61");if(!e.meta||typeof e.meta!="object")throw new Error("JS \u6A21\u5757\u7F3A\u5C11 meta");if(typeof e.api!="function")throw new Error("JS \u6A21\u5757\u7F3A\u5C11 api(fastify)");let r={...e.meta},n=h7r(r.key||t.key||t.id||t.name),i=String(r.name||t.name||n||"local_js").trim();if(!n)throw new Error("JS spider key \u4E0D\u80FD\u4E3A\u7A7A");return{...e,meta:{...r,key:n,name:i,type:Number(r.type??t.type??3),js:!0}}}function bQe(e,t){let r=Bmi(e,t),n=h7r(r.key||r.id||r.name||Wd.default.basename(String(r.path||r.file||"local_js"),".js")),i=String(r.name||n||"\u672C\u5730JS").trim(),a=null;async function s(){return a||(a=(async()=>{let o=await Wmi(r,i),c=typeof o=="function"?await o(i,r):o;return Ymi(c,{...r,key:n,name:i})})()),a}return{meta:{key:n,name:i,type:Number(r.type??3),js:!0},api:async o=>{try{return(await s()).api(o)}catch(c){console.error(`[js] \u52A0\u8F7D ${i} \u5931\u8D25:`,c);let u=async(l,x)=>x.code(500).send({code:-1,message:`JS spider \u52A0\u8F7D\u5931\u8D25: ${c?.message||c}`});o.post("/init",u),o.post("/home",u),o.post("/category",u),o.post("/detail",u),o.post("/play",u),o.post("/search",u)}},check:o=>{s().then(c=>c.check?.(o)).catch(c=>console.error(`[js] \u52A0\u8F7D ${i} \u5931\u8D25:`,c))}}}br();On();var Wue=Pe(require("crypto"),1);_o();Ci();var EQe=class{constructor(){this.cache={short:new Map,medium:new Map,long:new Map},this.accessOrder={short:new Map,medium:new Map,long:new Map},this.config={short:{max:1e3,ttl:30*1e3},medium:{max:500,ttl:5*60*1e3},long:{max:200,ttl:30*60*1e3}},this.cleanupTimer=null,this.startCleanupInterval()}get(t,r="medium"){let n=this.cache[r],i=this.accessOrder[r];if(!n)return null;let a=n.get(t);return a?Date.now()>a.expiry?(n.delete(t),i?.delete(t),null):(i?.set(t,Date.now()),a.lastAccess=Date.now(),a.accessCount=(a.accessCount||0)+1,a.value):null}set(t,r,n="medium"){let i=this.cache[n],a=this.accessOrder[n];if(!i)return;let s=this.config[n];i.size>=s.max&&this.evictOldest(n),i.set(t,{value:r,expiry:Date.now()+s.ttl,type:n,setTime:Date.now(),accessCount:0,lastAccess:Date.now()}),a?.set(t,Date.now())}evictOldest(t){let r=this.cache[t],n=this.accessOrder[t],i=null,a=1/0;for(let[s]of r.entries()){let o=n?.get(s)||0;o<a&&(a=o,i=s)}i&&(r.delete(i),n?.delete(i))}generateKey(t,r={}){try{let i=Object.keys(r).sort().map(s=>`${s}=${r[s]}`),a=i.length?`${t}?${i.join("&")}`:t;return a.length>256?Wue.default.createHash("md5").update(a).digest("hex"):a}catch{return t}}clear(t=null){t?(this.cache[t]?.clear(),this.accessOrder[t]?.clear()):(Object.values(this.cache).forEach(r=>r.clear()),Object.values(this.accessOrder).forEach(r=>r.clear()))}startCleanupInterval(){this.cleanupTimer=setInterval(()=>this.cleanupExpired(),5*60*1e3),typeof this.cleanupTimer.unref=="function"&&this.cleanupTimer.unref()}cleanupExpired(){let t=Date.now();Object.entries(this.cache).forEach(([r,n])=>{let i=this.accessOrder[r];for(let[a,s]of n.entries())t>s.expiry&&(n.delete(a),i?.delete(a))})}};function Xmi(e,t={}){return JSON.stringify({id:String(e||"").trim(),meta:{...t}})}function Qmi(e){let t=String(e||"").trim();if(!t)return{id:"",meta:{}};try{let r=JSON.parse(t);return r&&typeof r=="object"&&!Array.isArray(r)&&r.id!=null?{id:String(r.id).trim(),meta:r.meta&&typeof r.meta=="object"?r.meta:{}}:{id:t,meta:{}}}catch{return{id:t,meta:{}}}}var SQe=class{constructor(t){this.config=t,this.cache=new EQe,this.queue=[],this.activeCount=0,this.maxConcurrent=t.maxConcurrent||6,this.abortControllers=new Map}async schedule(t,r=null){return this.activeCount<this.maxConcurrent?(this.activeCount++,this.execute(t,r)):new Promise((n,i)=>{this.queue.push({fn:t,resolve:n,reject:i,requestId:r})})}async execute(t,r){try{return await t()}catch(n){throw n}finally{this.activeCount--,r&&this.abortControllers.delete(r),this.processNext()}}processNext(){if(this.queue.length>0&&this.activeCount<this.maxConcurrent){let{fn:t,resolve:r,reject:n,requestId:i}=this.queue.shift();this.activeCount++,this.execute(t,i).then(r).catch(n)}}async retryRequest(t,r=3,n=1e3){let i;for(let a=0;a<=r;a++)try{let s=`req_${Wue.default.randomUUID()}`,o=new AbortController;return this.abortControllers.set(s,o),await this.schedule(async()=>{let c=this.config.timeout||1e4,u=null;try{return await Promise.race([t(o.signal),new Promise((l,x)=>{u=setTimeout(()=>{o.abort(),x(new Error(`\u8BF7\u6C42\u8D85\u65F6 (${c}ms)`))},c)})])}finally{u&&clearTimeout(u)}},s)}catch(s){if(i=s,a===r||!this.shouldRetry(s))break;await this.sleep(n*Math.pow(2,a))}throw i}shouldRetry(t){if(!t.response)return!0;let r=t.response.status;return[408,429,500,502,503,504].includes(r)}getCachedResponse(t,r="medium"){let i=[r,...["short","medium","long"].filter(a=>a!==r)];for(let a of i){let s=this.cache.get(t,a);if(s)return s}return null}async cachedGet(t,r={},n="medium"){let i=this.cache.generateKey(t,r.params),a=this.getCachedResponse(i,n);if(a)return a;let s=`${n}:${i}`;return p2(`emby:${this.config.id}:${s}`,async()=>{try{let o=await this.retryRequest(c=>tt.get(t,{...r,signal:c}),this.config.retryCount||2);if(o.data){let u=JSON.stringify(o.data).length>1024*100?"long":n;this.cache.set(i,o,u),u!==n&&this.cache.set(i,o,n)}return o}catch(o){let c=this.getCachedResponse(i,n);if(c&&!o.response)return c;throw o}},(this.config.timeout||1e4)*((this.config.retryCount||2)+1)+2e3)}async post(t,r,n={}){return this.retryRequest(i=>tt.post(t,r,{...n,signal:i}),this.config.retryCount||1)}abortRequest(t){let r=this.abortControllers.get(t);r&&(r.abort(),this.abortControllers.delete(t))}sleep(t){return $t(t)}},TQe=class{constructor(t,r,n,i){this.config=t,this.requestManager=r,this.getHeaderProvider=n,this.urlBuilder=i,this.enablePlaybackReport=t.enablePlaybackReport!==!1,this.playSessions=new Map,this.heartbeatTimer=null,this.maxSessionDuration=7200*1e3,this.maxConcurrentReports=5,this.reportQueue=[]}startHeartbeat(){this.heartbeatTimer||!this.enablePlaybackReport||(this.heartbeatTimer=setInterval(()=>this.tick(),1e4))}stopHeartbeat(){this.heartbeatTimer&&(clearInterval(this.heartbeatTimer),this.heartbeatTimer=null)}async tick(){if(!this.enablePlaybackReport||this.playSessions.size===0){this.playSessions.size===0&&this.stopHeartbeat();return}let t=Date.now(),r=[];for(let[n,i]of this.playSessions.entries()){if(t-i.startTime>this.maxSessionDuration){this.playSessions.delete(n);continue}if(!i.isPaused&&t-i.lastReportTime>=3e4){let a=t-i.startTime-i.totalPausedDuration,s=i.initialPositionTicks+Math.floor(a/1e3)*1e7;if(i.positionTicks=s,i.lastReportTime=t,r.push(this.recordPlaybackProgress(n,s,!1)),r.length>=this.maxConcurrentReports)break}}r.length>0&&await Promise.allSettled(r)}async recordPlaybackStart(t,r,n=0){if(!this.enablePlaybackReport)return null;try{let i=await this.getHeaderProvider(),a=`js_${Date.now()}_${Math.floor(Math.random()*1e4)}`,s=n;if(!s)try{let u=this.urlBuilder(`/Users/${this.config.userId}/Items/${t}`),l=await this.requestManager.cachedGet(u,{headers:i,params:{Fields:"UserData"}},"short");l.data?.UserData&&(s=l.data.UserData.PlaybackPositionTicks||0)}catch(u){console.debug("\u83B7\u53D6\u7528\u6237\u6570\u636E\u5931\u8D25:",u.message)}let o={ItemId:t,MediaSourceId:r.Id||r.mediaSourceId,CanSeek:!0,IsPaused:!1,IsMuted:!1,PositionTicks:s,PlayMethod:"DirectStream",PlaySessionId:a,LiveStreamId:null,AudioStreamIndex:1,SubtitleStreamIndex:-1,VolumeLevel:100,PlaybackStartTimeTicks:Math.floor(Date.now()*1e4)},c=await this.requestManager.post(this.urlBuilder("/Sessions/Playing"),o,{headers:i,timeout:5e3}).catch(()=>null);if(c&&(c.status===200||c.status===204))return this.playSessions.set(a,{itemId:t,mediaSource:r,startTime:Date.now(),lastReportTime:Date.now(),initialPositionTicks:s,positionTicks:s,totalPausedDuration:0,isPaused:!1,lastPauseTime:0}),this.startHeartbeat(),a}catch(i){console.debug("\u64AD\u653E\u5F00\u59CB\u8BB0\u5F55\u5931\u8D25:",i.message)}return null}async recordPlaybackProgress(t,r,n=!1){if(!this.enablePlaybackReport||!this.playSessions.has(t))return!1;try{let i=this.playSessions.get(t),a=await this.getHeaderProvider();i.isPaused!==n&&(i.isPaused=n,n?i.lastPauseTime=Date.now():i.lastPauseTime>0&&(i.totalPausedDuration+=Date.now()-i.lastPauseTime,i.lastPauseTime=0)),r!==void 0&&(i.positionTicks=r);let s={ItemId:i.itemId,MediaSourceId:i.mediaSource.Id||i.mediaSource.mediaSourceId,PositionTicks:i.positionTicks,IsPaused:n,PlaySessionId:t,EventName:n?"pause":"timeupdate"},o=await this.requestManager.post(this.urlBuilder("/Sessions/Playing/Progress"),s,{headers:a,timeout:5e3}).catch(()=>null);if(o&&(o.status===200||o.status===204))return i.lastReportTime=Date.now(),!0}catch(i){console.debug("\u64AD\u653E\u8FDB\u5EA6\u8BB0\u5F55\u5931\u8D25:",i.message)}return!1}async recordPlaybackStop(t,r=null){if(!this.playSessions.has(t))return!1;try{let n=this.playSessions.get(t),i=await this.getHeaderProvider(),a;if(r!==null)a=r;else if(n.positionTicks!==void 0)a=n.positionTicks;else{let c=Date.now(),u=c-n.startTime;n.isPaused&&n.lastPauseTime>0&&(n.totalPausedDuration+=c-n.lastPauseTime),u-=n.totalPausedDuration;let l=Math.floor(u/1e3);a=n.initialPositionTicks+l*1e7}let s={ItemId:n.itemId,MediaSourceId:n.mediaSource.Id||n.mediaSource.mediaSourceId,PositionTicks:a,PlaySessionId:t},o=await this.requestManager.post(this.urlBuilder("/Sessions/Playing/Stopped"),s,{headers:i,timeout:5e3}).catch(()=>null);return this.playSessions.delete(t),this.playSessions.size===0&&this.stopHeartbeat(),o&&(o.status===200||o.status===204)}catch(n){this.playSessions.delete(t),this.playSessions.size===0&&this.stopHeartbeat(),console.debug("\u64AD\u653E\u505C\u6B62\u8BB0\u5F55\u5931\u8D25:",n.message)}return!1}async recordPlaybackPause(t,r){if(!this.enablePlaybackReport||!this.playSessions.has(t))return!1;try{let n=this.playSessions.get(t);return n.isPaused=!0,n.lastPauseTime=Date.now(),r!==void 0&&(n.positionTicks=r),await this.recordPlaybackProgress(t,r,!0)}catch(n){console.debug("\u64AD\u653E\u6682\u505C\u8BB0\u5F55\u5931\u8D25:",n.message)}return!1}async recordPlaybackUnpause(t,r){if(!this.enablePlaybackReport||!this.playSessions.has(t))return!1;try{let n=this.playSessions.get(t);return n.isPaused&&n.lastPauseTime>0&&(n.totalPausedDuration+=Date.now()-n.lastPauseTime),n.isPaused=!1,n.lastPauseTime=0,r!==void 0&&(n.positionTicks=r),await this.recordPlaybackProgress(t,r,!1)}catch(n){console.debug("\u64AD\u653E\u6062\u590D\u8BB0\u5F55\u5931\u8D25:",n.message)}return!1}async cleanupAllSessions(){let t=[];for(let r of this.playSessions.keys())t.push(this.recordPlaybackStop(r));return Promise.allSettled(t)}setEnablePlaybackReport(t){this.enablePlaybackReport=t,t||this.cleanupAllSessions()}getSession(t){return this.playSessions.get(t)}},vQe=(e,t,r,n=null,i=null)=>{let a=new URLSearchParams({UserId:i||e.userId,StartTimeTicks:"0",IsPlayback:"true",AutoOpenLiveStream:"true",MaxStreamingBitrate:"7000000","X-Emby-Client":e.client,"X-Emby-Device-Name":e.deviceName,"X-Emby-Device-Id":e.deviceId,"X-Emby-Client-Version":e.clientVersion,"X-Emby-Token":e.token,reqformat:"json"});return n&&a.set("MediaSourceId",n),`${t(`/Items/${r}/PlaybackInfo`)}?${a.toString()}`},Jmi=(e,t)=>t.DirectStreamUrl?t.DirectStreamUrl.startsWith("http")?t.DirectStreamUrl:e.server+t.DirectStreamUrl:t.Path&&t.Path.startsWith("http")?t.Path:e.isJellyfin?`${e.server}/Videos/${t.Id}/stream?static=true&api_key=${e.token}`:`${e.server}/emby/videos/${t.Id}/original?api_key=${e.token}&Static=true`;function g7r(e){let t={id:e.id,name:e.name||`Emby ${e.id.slice(0,8)}`,server:(e.server||"").replace(/\/$/,""),username:e.username||"",password:e.password||"",token:e.token||"",userId:e.userId||"",deviceId:e.deviceId||Wue.default.randomUUID(),deviceName:e.deviceName||"iPhone",client:e.client||"SenPlayer",clientVersion:e.clientVersion||"5.6.3",enablePlaybackReport:e.enablePlaybackReport!==!1,enabled:e.enabled!==!1,timeout:e.timeout||1e4,retryCount:e.retryCount||2,cacheViews:e.cacheViews!==!1,maxConcurrent:e.maxConcurrent||6,isJellyfin:e.isJellyfin||!1,serverType:e.isJellyfin?"jellyfin":"emby"},r=`/config/embyInstances/${t.id}`;function n(ce){let Z=t.isJellyfin?"":"/emby";return`${t.server}${Z}${ce}`}let i={"User-Agent":`${t.client}/${t.clientVersion}`,"X-Emby-Client":t.client,"X-Emby-Device-Name":t.deviceName,"X-Emby-Client-Version":t.clientVersion,"X-Emby-Device-Id":t.deviceId,...t.isJellyfin?{"X-Jellyfin-Client":t.client,"X-Jellyfin-Client-Version":t.clientVersion,"X-Jellyfin-Device-Id":t.deviceId,"X-Jellyfin-Device-Name":t.deviceName}:{}};async function a(){let ce={...i};if(t.token){let Z=`MediaBrowser Token="${t.token}", UserId="${t.userId}", Client="${t.client}", Device="${t.deviceName}", DeviceId="${t.deviceId}", Version="${t.clientVersion}"`;ce["X-Emby-Authorization"]=Z,ce["X-Emby-Token"]=t.token,t.isJellyfin&&(ce["X-Jellyfin-Token"]=t.token,ce["X-Jellyfin-Authorization"]=Z.replace("MediaBrowser","MediaBrowser"))}return ce}let s=new SQe(t),o=new TQe(t,s,a,n),c=["\u64AD\u653E\u5217\u8868","\u76F8\u673A","Playlists","Collections","Trailers","\u76F4\u64AD"],u=90,l=400,x=30,d=50,f=200,p=3e3;function m(ce){let Z=Number.parseInt(ce?.IndexNumber,10);return Number.isNaN(Z)?Number.MAX_SAFE_INTEGER:Z}function g(ce){if(!ce?.IndexNumber)return"";let Z=ce.Name||`\u7B2C${ce.IndexNumber||0}\u96C6`,ae=ce.MediaSources||[];if(ae.length>1){/* 多版本不在详情页展开（@@ 嵌套会和季/集选择冲突）：只给一个入口，画质改在播放页选 */let H=ae[0];return`${Z}$${ce.Id}|${H.Id}`}if(ae.length===1){let H=ae[0];/* 单版本：显示集名（版本名在播放页显示），避免每集都叫「1080P」分不清 */return`${Z}$${ce.Id}|${H.Id}`}let fe=vQe(t,n,ce.Id,null,t.userId);return`${Z}$${fe}`}function h(ce){if(!Array.isArray(ce)||ce.length===0)return"";let Z=[],ae=[...ce].sort((fe,H)=>m(fe)-m(H));for(let fe of ae){let H=g(fe);H&&Z.push(H)}return Z.join("#")}function _(ce){let Z=Number.parseInt(ce,10);return Number.isNaN(Z)?Number.MAX_SAFE_INTEGER:Z}function y(ce){let Z=_(ce?.ParentIndexNumber),ae=ce?.SeasonName||(Z!==Number.MAX_SAFE_INTEGER?`\u7B2C${Z}\u5B63`:"\u7279\u522B\u7BC7"),fe=ce?.SeasonId||"";return{groupKey:fe||`idx_${Z}_${ae}`,seasonId:fe,seasonIndex:Z,seasonName:ae}}async function A(ce,Z,ae,fe="medium"){let H=[],j=0,ne=Number.MAX_SAFE_INTEGER;for(;j<ne&&H.length<p;){let O=await s.cachedGet(ce,{headers:ae,params:{...Z,Limit:f,StartIndex:j}},fe),U=O.data?.Items||[],$=Number.parseInt(O.data?.TotalRecordCount,10);if(Number.isNaN($)||(ne=$),U.length===0||(H.push(...U),U.length<f))break;j+=U.length}return H.slice(0,p)}async function v(ce,Z){let ae="Id,Name,IndexNumber,ParentIndexNumber,SeasonId,SeasonName,MediaSources",fe=n(`/Shows/${ce}/Episodes`);try{let j=await A(fe,{UserId:t.userId,Fields:ae,SortBy:"ParentIndexNumber,IndexNumber",SortOrder:"Ascending"},Z,"medium");if(j.length>0)return j}catch(j){console.debug("\u6309\u5267\u96C6\u63A5\u53E3\u83B7\u53D6\u5931\u8D25\uFF0C\u5C1D\u8BD5\u7528\u6237\u63A5\u53E3:",j.message)}let H=n(`/Users/${t.userId}/Items`);return A(H,{ParentId:ce,IncludeItemTypes:"Episode",Recursive:!0,Fields:ae,SortBy:"ParentIndexNumber,IndexNumber",SortOrder:"Ascending"},Z,"medium")}function S(){return!(!t.server||!t.token&&!t.username)}async function R(ce){if(!t.username||!t.server)return{success:!1,reason:"\u7F3A\u5C11\u767B\u5F55\u51ED\u8BC1"};let Z=t.isJellyfin?"/Users/AuthenticateByName":"/emby/Users/AuthenticateByName",ae=`${t.server}${Z}`,fe={Password:t.password||"",Pw:t.password||"",Username:t.username},H=`MediaBrowser Token="", UserId="", Client="${t.client}", Device="${t.deviceName}", DeviceId="${t.deviceId}", Version="${t.clientVersion}"`,j={Host:t.server.replace(/^https?:\/\//,"").replace(/\/$/,""),"Content-Type":"application/json","X-Emby-Authorization":H,Connection:"keep-alive",Accept:"*/*","User-Agent":`${t.client}/${t.clientVersion}`,"Accept-Language":"zh-CN,zh-Hans;q=0.9","Accept-Encoding":"gzip, deflate",...t.isJellyfin?{"X-Jellyfin-Authorization":H,"X-Jellyfin-Client":t.client,"X-Jellyfin-Device-Name":t.deviceName,"X-Jellyfin-Device-Id":t.deviceId,"X-Jellyfin-Client-Version":t.clientVersion}:{}};try{let ne=await tt.post(ae,fe,{headers:j,timeout:5e3});if(ne.data?.AccessToken)return t.token=ne.data.AccessToken,t.userId=ne.data.User.Id,ce?.server?.db&&await ce.server.db.push(r,{token:t.token,userId:t.userId,deviceId:t.deviceId,deviceName:t.deviceName,client:t.client,clientVersion:t.clientVersion}),{success:!0,token:t.token}}catch(ne){console.debug("SenPlayer\u683C\u5F0F\u767B\u5F55\u5931\u8D25:",ne.message);try{let U=`${t.server}/emby/Users/AuthenticateByName`,$={"Content-Type":"application/json","X-Emby-Client":t.client,"X-Emby-Device-Name":t.deviceName,"X-Emby-Device-Id":t.deviceId,"X-Emby-Client-Version":t.clientVersion,"User-Agent":"Mozilla/5.0"},V=await tt.post(U,fe,{headers:$,timeout:5e3});if(V.data?.AccessToken)return t.token=V.data.AccessToken,t.userId=V.data.User.Id,ce?.server?.db&&await ce.server.db.push(r,{token:t.token,userId:t.userId,deviceId:t.deviceId,deviceName:t.deviceName,client:t.client,clientVersion:t.clientVersion}),{success:!0,token:t.token}}catch(O){console.debug("Emby\u6807\u51C6\u683C\u5F0F\u767B\u5F55\u5931\u8D25:",O.message)}}return{success:!1,reason:"\u767B\u5F55\u5931\u8D25"}}async function w(ce){if(t.token&&t.userId)try{let Z=await a(),ae=n(`/Users/${t.userId}`);return await s.cachedGet(ae,{headers:Z},"short"),!0}catch(Z){Z.response?.status}return(await R(ce)).success}async function C(){try{let ce=await a();return!!(await s.cachedGet(n("/System/Info"),{headers:ce},"short")).data}catch{return!1}}function N(ce,Z,ae={}){if(!Z)return"";let{maxWidth:fe=l,quality:H=u,imageType:j="Primary"}=ae,ne=`/Items/${ce}/Images/${j}`,O=`?maxWidth=${fe}&tag=${Z}&quality=${H}`;return t.isJellyfin?`${t.server}${ne}${O}`:`${t.server}/emby${ne}${O}`}function k(ce){let Z=String(ce?.headers?.["x-forwarded-proto"]||ce?.protocol||"http").split(",")[0].trim()||"http",ae=String(ce?.headers?.["x-forwarded-host"]||ce?.headers?.host||"").split(",")[0].trim();return ae?`${Z}://${ae}`:""}function P(ce,Z,ae={},fe=null){if(!Z)return"";let{maxWidth:H=l,quality:j=u,imageType:ne="Primary"}=ae,O=k(fe);if(!O)return N(ce,Z,ae);let U=new URL(`${O}/spider/emby_${t.id}/3/proxy/image`);return U.searchParams.set("itemId",String(ce||"")),U.searchParams.set("tag",String(Z||"")),U.searchParams.set("imageType",String(ne||"Primary")),U.searchParams.set("maxWidth",String(H)),U.searchParams.set("quality",String(j)),U.toString()}async function L(ce,Z){if(!await w(ce))return Z.code(401).send("\u767B\u5F55\u5931\u8D25");let ae=String(ce?.query?.itemId||"").trim(),fe=String(ce?.query?.tag||"").trim(),H=String(ce?.query?.imageType||"Primary").trim()||"Primary",j=Math.max(1,Number.parseInt(ce?.query?.maxWidth,10)||l),ne=Math.max(1,Number.parseInt(ce?.query?.quality,10)||u);if(!ae||!fe)return Z.code(400).send("missing image params");try{let O=await a(),U=N(ae,fe,{maxWidth:j,quality:ne,imageType:H}),$=await tt.get(U,{headers:{...O,Accept:"image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"},responseType:"stream",timeout:t.timeout||1e4,validateStatus:()=>!0});return($.status||500)>=400||!$.data?Z.code($.status||502).send("fetch image failed"):($.headers["content-type"]&&Z.header("Content-Type",$.headers["content-type"]),$.headers["content-length"]&&Z.header("Content-Length",$.headers["content-length"]),Z.header("Access-Control-Allow-Origin","*"),Z.header("Cache-Control","public, max-age=300"),Z.send($.data))}catch{return Z.code(502).send("proxy image error")}}async function F(ce,Z){try{if(!S())return{success:!1,error:"\u914D\u7F6E\u4E0D\u5B8C\u6574"};if(ce?.server?.db){let ae=await ce.server.db.getObjectDefault(r,{});ae?.deviceId&&Object.assign(t,ae)}return(!t.token||!t.userId)&&!await w(ce)?{success:!1,error:"\u767B\u5F55\u5931\u8D25"}:{success:!0,name:t.name,server:t.server,serverType:t.serverType}}catch(ae){return{success:!1,error:ae.message}}}async function Q(ce,Z){let ae=kr("emby",{...arguments[0],cacheKeyExtra:t.id}),fe=Pr(ae);if(fe)return fe;if(!await w(ce))return{class:[],error:"\u767B\u5F55\u5931\u8D25"};try{let H=await a(),j=n(`/Users/${t.userId}/Views`),ne=t.cacheViews?"long":"short",U=(await s.cachedGet(j,{headers:H},ne)).data.Items||[],$=[],V={};U.filter(G=>!c.some(ee=>G.Name.includes(ee))).forEach(G=>{let ee=G.Id.toString();$.push({type_id:ee,type_name:G.Name,type_image:P(G.Id,G.ImageTags?.Primary,{maxWidth:200,imageType:"Thumb"},ce)});let Y=[{n:"\u6700\u8FD1\u6DFB\u52A0",v:"dateadded"},{n:"\u6700\u8FD1\u53D1\u884C",v:"premieredate_desc"},{n:"\u6700\u8FD1\u64AD\u653E",v:"dateplayed"},{n:"\u5E74\u4EFD\u65B0\u2192\u65E7",v:"year_desc"},{n:"\u5E74\u4EFD\u65E7\u2192\u65B0",v:"year_asc"},{n:"\u8BC4\u5206\u6700\u9AD8",v:"rating"},{n:"\u540D\u79F0A\u2192Z",v:"name"}],J=[{n:"\u5168\u90E8",v:""},{n:"2026",v:"2026"}];for(let te=2025;te>=2010;te--)J.push({n:String(te),v:String(te)});let q=[{n:"\u5168\u90E8",v:""},..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map(te=>({n:te,v:te}))];V[ee]=[{key:"tid",name:"\u6392\u5E8F",init:"dateadded",value:Y},{key:"year",name:"\u5E74\u4EFD",init:"",value:J},{key:"letter",name:"\u5B57\u6BCD",init:"",value:q}]});let K={class:$,filters:V};return Lr(ae,K,Ut.semiStatic),K}catch{return{class:[],error:"\u83B7\u53D6\u9996\u9875\u5931\u8D25"}}}async function z(ce,Z){let ae=ce.body.id,fe=parseInt(ce.body.page,10)||1;fe<1&&(fe=1);let H=x,j=(fe-1)*H;if(!await w(ce))return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let ne=await a(),O=n(`/Users/${t.userId}/Items`),U=ce.body.filters||{},$=U.tid||"dateadded",V=U.year||"",K=U.letter||"",G={dateadded:{sortBy:"DateCreated,SortName",sortOrder:"Descending"},premieredate_desc:{sortBy:"PremiereDate,SortName",sortOrder:"Descending"},dateplayed:{sortBy:"DatePlayed,SortName",sortOrder:"Descending"},year_asc:{sortBy:"ProductionYear,SortName",sortOrder:"Ascending"},year_desc:{sortBy:"ProductionYear,SortName",sortOrder:"Descending"},rating:{sortBy:"CommunityRating,SortName",sortOrder:"Descending"},name:{sortBy:"SortName",sortOrder:"Ascending"}},{sortBy:ee,sortOrder:Y}=G[$]||G.dateadded,J={SortBy:ee,SortOrder:Y,ParentId:ae,Recursive:"true",Limit:H,StartIndex:j,Fields:"ProductionYear,Status,DateCreated,CommunityRating,PremiereDate",IncludeItemTypes:"Movie,Series",ImageTypeLimit:1,EnableImageTypes:"Primary,Backdrop",EnableUserData:"true"};if(V){let Ie=parseInt(V,10);isNaN(Ie)||(J.Years=Ie.toString())}K&&(J.NameStartsWith=K);let q=await s.cachedGet(O,{headers:ne,params:J},"medium"),te=q.data.Items||[],le=q.data.TotalRecordCount||0,ye=te.map(Ie=>{let $e=Ie.CommunityRating?`\u2B50${Ie.CommunityRating.toFixed(1)}`:"",Ve=Ie.ProductionYear||"",De=[$e,Ve].filter(Boolean).join(" ");return{vod_id:Xmi(Ie.Id,{vod_pic:P(Ie.Id,Ie.ImageTags?.Primary,{},ce),vod_remarks:De}),vod_name:Ie.Name,vod_pic:P(Ie.Id,Ie.ImageTags?.Primary,{},ce),vod_remarks:De,vod_year:Ve,vod_score:Ie.CommunityRating||0}}),Te=Math.ceil(le/H);return{list:ye,page:fe,pagecount:Te,limit:H,total:le}}catch{return{list:[],error:"\u83B7\u53D6\u5206\u7C7B\u5931\u8D25"}}}async function re(ce,Z){let ae=Qmi(ce.body.id),fe=ae.id;if(!await w(ce))return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let H=await a(),j=n(`/Users/${t.userId}/Items/${fe}`),O=(await s.cachedGet(j,{headers:H,params:{Fields:"MediaSources,Overview,Genres,ProductionYear,OfficialRating,RunTimeTicks,People,Studios,Taglines,Type"}},"long")).data,U={vod_id:O.Id,vod_name:O.Name,vod_pic:ae.meta?.vod_pic||P(O.Id,O.ImageTags?.Primary,{},ce),vod_type:O.Genres?.join(",")||"",vod_year:O.ProductionYear||"",vod_area:O.ProductionLocation||"",vod_actor:O.People?.filter(K=>K.Type==="Actor").map(K=>K.Name).join(",")||"",vod_director:O.People?.filter(K=>K.Type==="Director").map(K=>K.Name).join(",")||"",vod_content:(O.Overview||"").replace(/\r\n/g," "),vod_remarks:ae.meta?.vod_remarks||O.OfficialRating||"",vod_play_from:"",vod_play_url:""},$=[],V=[],$s=[];if(O.Type==="Series")try{let K=[];try{let q=n(`/Shows/${fe}/Seasons`);K=(await s.cachedGet(q,{headers:H,params:{UserId:t.userId,Fields:"Id,Name,IndexNumber",EnableTotalRecordCount:!1}},"long")).data?.Items||[]}catch(q){console.debug("\u83B7\u53D6\u5B63\u5217\u8868\u5931\u8D25\uFF0C\u7EE7\u7EED\u5C1D\u8BD5\u6279\u91CF\u83B7\u53D6\u5267\u96C6:",q.message)}let G=await v(fe,H),ee=new Map;for(let q of G){let te=y(q);ee.has(te.groupKey)||ee.set(te.groupKey,{...te,episodes:[]}),ee.get(te.groupKey).episodes.push(q)}let Y=[...K].sort((q,te)=>_(q?.IndexNumber)-_(te?.IndexNumber));for(let q of Y){let te=q?.Id||"",le=te?ee.get(te):null;if(!le||le.episodes.length===0)continue;let ye=h(le.episodes);ye&&($.push(q.Name||le.seasonName||`Season ${q.IndexNumber||te}`),V.push(ye),$s.push(_(q?.IndexNumber)),ee.delete(te))}let J=[...ee.values()].sort((q,te)=>q.seasonIndex!==te.seasonIndex?q.seasonIndex-te.seasonIndex:(q.seasonName||"").localeCompare(te.seasonName||""));for(let q of J){if(!q.episodes||q.episodes.length===0)continue;let te=h(q.episodes);te&&($.push(q.seasonName||t.name),V.push(te),$s.push(_(q.seasonIndex)))}}catch(K){console.debug("\u83B7\u53D6\u5267\u96C6\u4FE1\u606F\u5931\u8D25:",K.message)}else{let K=O.MediaSources||[];if(K.length>0)K.forEach(G=>{let ee=G.Name||"\u9ED8\u8BA4\u7EBF\u8DEF";$.push(ee);let Y=vQe(t,n,fe,G.Id,t.userId);V.push(`${O.Name}$${Y}`)});else{$.push(t.name);let G=vQe(t,n,fe,null,t.userId);V.push(`${O.Name}$${G}`)}}/* 搜索时带了季数（如「侠探杰克 第四季」）：把这一季排到第一组，进来就能看到。
+   旧写法只比 $s.indexOf(ws)（IndexNumber），遇到季名是自定义中文/英文时对不上；
+   这里先按 IndexNumber 找，找不到再用季名解析（Season 4 / 第四季 / S4）。 */
+if(ae.meta&&ae.meta.season>0&&$.length>1){
+  let ws=Number(ae.meta.season),ix=$s.indexOf(ws);
+  if(ix<0){for(let k=0;k<$.length;k++){if(spSeasonNumberOf($[k])===ws){ix=k;break}}}
+  if(ix>0){let nf=$.splice(ix,1)[0],nu=V.splice(ix,1)[0];$.unshift(nf);V.unshift(nu)}
+}return $.length===0||V.length===0?{list:[],error:"\u65E0\u6CD5\u83B7\u53D6\u64AD\u653E\u5217\u8868"}:(U.vod_play_from=$.join("$$$"),U.vod_play_url=V.join("$$$"),{list:[U]})}catch(H){return console.debug("\u83B7\u53D6\u8BE6\u60C5\u5931\u8D25:",H.message),{list:[],error:"\u83B7\u53D6\u8BE6\u60C5\u5931\u8D25"}}}/* 搜索词剥离季数：用户常搜「侠探杰克 第四季」，而 Emby 的 SearchTerm 是按片名索引的，
+   整句带上季数会 0 命中。这里剥出片名 + 季号，片名去搜，季号用于把该季排到最前。 */
+/* ================= 季数感知搜索内核（片名 + 第N季） ================= */
+/* 旧实现「原词优先，原词 0 命中才剥季数」有三个问题：
+   ① 剥季数只认空格分隔，中文习惯的「侠探杰克第四季」「片名（第四季）」「Reacher S4」剥不掉；
+   ② 只要原词有任意命中就再也不试剥季后的片名；
+   ③ 剥季后不考虑「同名多部」（海贼王 1999 / 2023），目标条目常被挤到第 2 页。
+   下面统一处理：识别季 → 剥季 → 出候选 → 打分排序。 */
+
+/** 中文数字 → 整数（只覆盖季数里出现的 1~99：四、十、十一、二十三） */
+var SP_CN = { "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9 };
+function spCnNum(t) {
+  t = String(t == null ? "" : t).replace(/\s+/g, "");
+  if (!t) return 0;
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  var m = t.match(/^([一二两三四五六七八九])?十([一二三四五六七八九])?$/);
+  if (m) return (m[1] ? SP_CN[m[1]] : 1) * 10 + (m[2] ? SP_CN[m[2]] : 0);
+  if (t.length === 1 && SP_CN[t] !== undefined) return SP_CN[t];
+  return 0;
+}
+
+function spNowYear() { return new Date().getFullYear(); }
+
+/** 统一成半角、单空格（全角括号留着，交给 spUnbracket 决定去留） */
+function spCleanQuery(x) {
+  return String(x == null ? "" : x)
+    .replace(/[\uFF01-\uFF5E]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
+    .replace(/\u3000/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 括号里的内容拆出来（「片名（第四季）」→「片名 第四季」），后面统一由剥季处理 */
+function spUnbracket(t) {
+  return String(t || "")
+    .replace(/[（(]\s*([^（）()]{1,80}?)\s*[）)]/g, " $1 ")
+    .replace(/【\s*([^【】]{1,80}?)\s*】/g, " $1 ")
+    .trim();
+}
+
+/**
+ * 从查询里识别「季」并返回剥离后的片名 → { title, season }。
+ * 支持：第四季 / 第 4 季 / 第四期 / 第四部(非「部分」) / Season 4 / season4 / S04 / 片名（第四季）
+ *      片名-S4 / 片名 S4 / 片名 4（裸数字必须带空格）
+ * 防误伤：海王2、蛟龙行动2 这种片名自带数字不会被剥（没有空格不算季数），
+ *        而且调用方永远把原词也放进候选，真剥错也能救回来。
+ */
+function findSeasonTag(wd) {
+  var raw = String(wd == null ? "" : wd).trim();
+  if (!raw) return { title: "", season: 0 };
+  var t = spCleanQuery(spUnbracket(raw));
+  var season = 0, hit = "";
+  var pats = [
+    /第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部](?!分)/,  // 第四季
+    /(?:^|[^a-z])season\s*([0-9]{1,2})(?![0-9])/i,                          // Season 4
+    /([0-9]{1,2})\s*season(?![a-z])/i,                                        // 4 Season
+    /(?:^|[^a-z0-9])s\s?([0-9]{1,2})(?![0-9a-z])/i,                           // S04 / S4
+    /([0-9]{1,2})\s?s\s?([0-9]{1,3})(?![0-9a-z])/i                            // 4s1 / 4s01
+  ];
+  for (var i = 0; i < pats.length && !season; i++) {
+    var m = t.match(pats[i]);
+    if (!m) continue;
+    var n = spCnNum(m[1]);
+    if (n > 0 && n <= 99) { season = n; hit = m[0]; }
+  }
+  var rest = t;
+  if (season && hit) rest = t.replace(hit, " ");
+  // 裸数字放最后：「Reacher 4」「侠探杰克 4」
+  if (!season) {
+    var m2 = t.match(/^(.+?)\s+([0-9]{1,2})$/);
+    if (m2 && String(m2[1]).trim()) { season = Number(m2[2]); rest = m2[1]; }
+  }
+  rest = spUnbracket(rest)
+    .replace(/[\-–—_·・•:：,，、]+/g, " ")
+    .replace(/[（(【\[\s]+$/g, "")
+    .replace(/^[\s）)】\]]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!rest) return { title: raw, season: 0 };   // 只输了「第四季」：退回原词
+  return { title: rest, season: season };
+}
+
+/** 两个片名是否同一条内容（忽略空格标点全半角） */
+function spSameTitle(a, b) {
+  var norm = function (x) {
+    return String(x == null ? "" : x).toLowerCase()
+      .replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～·・•]/g, "");
+  };
+  var na = norm(a), nb = norm(b);
+  return !!na && na === nb;
+}
+
+/**
+ * 搜索候选（按优先级，已去重）：
+ *   ① 原词             —— 片名自带数字时（海王2 / 蛟龙行动 2）原词才准
+ *   ② 剥掉季数的片名   —— 「侠探杰克 第四季」→「侠探杰克」
+ *   ③ 去标点的版本     —— TMDB 里偶尔存成「Spider-Man」这类带连字符的写法
+ * 每项带 { q, type(raw|stripped), season, title }，打分时用来区分「是谁命中的」。
+ */
+function searchPlan(wd) {
+  var raw = spCleanQuery(wd);
+  var tag = findSeasonTag(raw);
+  var out = [], seen = {};
+  function push(q, type) {
+    q = spCleanQuery(q);
+    if (!q) return;
+    var k = q.toLowerCase();
+    if (seen[k]) return;
+    seen[k] = 1;
+    out.push({ q: q, type: type, season: tag.season, title: tag.title });
+  }
+  push(raw, "raw");
+  if (tag.season > 0 && !spSameTitle(tag.title, raw)) push(tag.title, "stripped");
+  var strip = /[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～]+/g;
+  var p1 = raw.replace(strip, "");
+  if (p1 && p1 !== raw) push(p1, "raw");
+  if (tag.season > 0) {
+    var p2 = tag.title.replace(strip, "");
+    if (p2 && p2 !== tag.title) push(p2, "stripped");
+  }
+  return out;
+}
+
+/**
+ * 相关度打分（越大越靠前）：
+ *   片名相等 +60 / 前缀 +40 / 原文名相等 +40 / 包含 +25
+ *   「剥季片名」命中 +15（原词命中往往是无关条目）
+ *   指定季：真有这一季 +30，明确没这季 -20
+ *   热度（0~12 分，封顶）+ 年份新近度（0~10 分）：同名多部（1999/2023 海贼王）靠这两个分开
+ * item: { name, original, year, popularity, hasType?, hasYear?, seasons?（季号数组，未知就不传） }
+ */
+function scoreCandidate(item, meta) {
+  var want = String((meta && meta.title) || "").trim();
+  var name = String((item && item.name) || "").trim();
+  var orig = String((item && item.original) || "").trim();
+  var sc = 0;
+  if (want) {
+    if (spSameTitle(name, want)) sc += 60;
+    else if (name && name.toLowerCase().indexOf(want.toLowerCase()) === 0) sc += 40;
+    else if (orig && orig.toLowerCase() === want.toLowerCase()) sc += 40;
+    else if (spSameTitle(orig, want)) sc += 40;
+    else if (name && (name.indexOf(want) >= 0 || want.indexOf(name) >= 0)) sc += 25;
+  }
+  if (meta && meta.type === "stripped") sc += 15;
+  if (meta && Number(meta.season) > 0 && Array.isArray(item && item.seasons)) {
+    sc += item.seasons.indexOf(Number(meta.season)) >= 0 ? 30 : -20;
+  }
+  // 元数据越完整越可信：TMDB 里存在「无类型、无年份、热度极低」的僵尸条目，
+  // 光靠片名相等（+60）会把它顶到真正的剧集前面（实测「Reacher S4」就踩到了）
+  // 缺类型且缺年份 = 多半是空壳条目，扣 15；缺其中一项只扣 5（正常条目常缺地区/年份）
+  if (item) {
+    if (!item.hasType && !item.hasYear) sc -= 15;
+    else if (!item.hasType || !item.hasYear) sc -= 5;
+  }
+  // 热度（对数，封顶 12）与票数（对数，封顶 25）：
+  //   真剧集动辄上千票（Reacher 4k+、ONE PIECE 100k+），空壳条目 0~几十票 → 自然沉底
+  var pop = Number((item && item.popularity) || 0);
+  if (pop > 0) sc += Math.min(12, Math.log(pop + 1) * 1.8);
+  var votes = Number((item && item.votes) || 0);
+  if (votes > 0) sc += Math.min(25, Math.log(votes + 1) * 3.2);
+  var y = Number(String((item && item.year) || "").slice(0, 4)) || 0;
+  if (y > 1900) sc += Math.max(0, 10 - Math.abs(spNowYear() - y) * 0.5);
+  return sc;
+}
+
+/** 按打分降序排序（稳定排序：同分保持上游原顺序） */
+function spSortByScore(list, meta) {
+  var scored = (list || []).map(function (it, i) { return { it: it, sc: scoreCandidate(it, meta), i: i }; });
+  scored.sort(function (a, b) { return (b.sc - a.sc) || (a.i - b.i); });
+  return scored.map(function (x) { return x.it; });
+}
+
+/** 季名 → 季号：「Season 4」「第四季」「S4」都能认（Emby 自定义季名常见这几种） */
+function spSeasonNumberOf(name) {
+  var t = String(name == null ? "" : name);
+  var m = t.match(/season\s*([0-9]{1,2})/i);
+  if (m) return Number(m[1]);
+  m = t.match(/第\s*([0-9]{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*[季期部]/);
+  if (m) return spCnNum(m[1]);
+  m = t.match(/^\s*s\s?([0-9]{1,2})\s*$/i);
+  if (m) return Number(m[1]);
+  return 0;
+}
+
+/** 剧集：把「目标季」排到第一组（详情页进来就能看到） */
+function planSeasonOrder(plans, wantSeason) {
+  var ws = Number(wantSeason) || 0;
+  var arr = Array.isArray(plans) ? plans.slice() : [];
+  if (!ws || arr.length < 2) return arr;
+  var idx = -1;
+  for (var i = 0; i < arr.length; i++) {
+    if (Number(arr[i] && arr[i].s) === ws) { idx = i; break; }
+  }
+  if (idx <= 0) return arr;
+  return [arr[idx]].concat(arr.filter(function (_, k) { return k !== idx; }));
+}
+
+/**
+ * 让 tmdbVod 生成的每个条目带上 TMDB 原件。
+ * 为什么不在 tmdbVod 里直接写 tmdbItem：它是在原始压缩包里的一行，
+ * 直接改容易和超长行里的其它代码打架；这里改成「按需包装一次」，幂等且可控。
+ * 用途：搜索排序要 genre_ids / popularity / vote_count 判断谁是正主。
+ */
+function ensureTmdbItem() {
+  if (globalThis.__lmTioVodWrapped === tmdbVod) return;
+  var orig = tmdbVod;
+  if (orig.__tmdbItemWrapped) { globalThis.__lmTioVodWrapped = tmdbVod; return; }
+  tmdbVod = function (item, kind) {
+    var v = orig(item, kind);
+    if (v && item) { try { v.tmdbItem = item; } catch (e) { } }
+    return v;
+  };
+  tmdbVod.__tmdbItemWrapped = true;
+  globalThis.__lmTioVodWrapped = tmdbVod;
+}
+
+/**
+ * 小并发跑 async 任务，结果按原顺序返回。
+ * 用途：拿到一个剧的所有季/集清单后补「季列表」，串行请求会拖慢十几秒。
+ */
+async function spMapLimit(arr, limit, fn) {
+  arr = Array.isArray(arr) ? arr : [];
+  var out = new Array(arr.length), next = 0, workers = [];
+  var n = Math.max(1, Math.min(limit || 4, arr.length || 1));
+  for (var w = 0; w < n; w++) {
+    workers.push((async function () {
+      while (true) {
+        var i = next++;
+        if (i >= arr.length) return;
+        try { out[i] = await fn(arr[i], i); } catch (e) { out[i] = null; }
+      }
+    })());
+  }
+  await Promise.all(workers);
+  return out;
+}
+
+/* 搜索词 → { title, season }（Emby 版）：
+   旧实现只认「空格分隔的季数」，中文习惯的「侠探杰克第四季」「侠探杰克（第四季）」「Reacher S4」
+   全都剥不掉 → SearchTerm 直接拿整句去问 Emby，库里按片名索引，必然 0 命中。
+   现在统一交给 findSeasonTag（与 torrentio / hdhub 同一套规则），既保留旧函数名，也保留旧逻辑兜底。 */
+function spQ(w){
+  return findSeasonTag(w);
+}
+/* 两个片名是否同一条内容（忽略空格/标点/全半角）：只有片名一致才打「第 N 季」标记，
+   避免搜「权力的游戏 第八季」时把只有 2 季的《龙族》也标成第 8 季。 */
+function spSame(a,b){
+  let n=x=>String(x==null?"":x).toLowerCase().replace(/[\s:：\-—_.,，。!！?？'"“”‘’()（）\[\]【】~～·・•]/g,"");
+  let na=n(a),nb=n(b);
+  return !!na&&na===nb;
+}
+async function se(ce,Z){
+  /* Upstream 版搜索（原名 se）：搜「片名 + 季数」的修复版。
+     旧逻辑：原词命中就返回、不排序、不补目标季 —— 用户体验就是「搜 XX 第四季什么都没有」。
+     新逻辑：
+       ① 候选词用 searchPlan（原词 / 剥季片名 / 去标点），中文习惯写法都能剥出片名；
+       ② 候选依次查，结果按「片名相关度 + 是否真有这一季」打分排序（spSortByScore）；
+       ③ 指定了季的话，目标剧条目额外带一段「补季」请求（见下面 fixSeriesSeason）——
+          Emby 的 /Shows/{id}/Seasons 偶尔漏掉新季（比如刚入库的第 4 季），补一次就能出现。 */
+  let raw=String((ce.body&&ce.body.wd)||"").trim();
+  let q=spQ(raw);
+  let plan=searchPlan(raw);
+  if(!plan.length)return{list:[]};
+  if(!await w(ce))return{list:[],error:"\u767B\u5F55\u5931\u8D25"};
+  try{
+    let fe=await a(),H=n(`/Users/${t.userId}/Items`);
+    // 只查前两个候选：原词 + 剥季片名。两个都查完再合并，避免「原词歪命中 → 直接返回」的老毛病
+    let want=Math.min(plan.length,2),seen={},items=[];
+    for(let k=0;k<want;k++){
+      let j={SearchTerm:plan[k].q,IncludeItemTypes:"Movie,Series",Recursive:"true",Limit:d,Fields:"ProductionYear,Type,OriginalTitle,SeriesId",EnableImageTypes:"Primary",SortBy:"SortName",SortOrder:"Ascending"};
+      let got=(await s.cachedGet(H,{headers:fe,params:j},"short")).data.Items||[];
+      for(let it of got){
+        let key=String(it.Id||"");
+        if(!key||seen[key])continue;
+        seen[key]=1;
+        // 打分需要：中文名 / 原名 / 年份 / 类型（热度 Emby 只给 CommunityRating，这里不参与）
+        items.push({raw:it,name:it.Name||"",original:it.OriginalTitle||"",year:it.ProductionYear||"",popularity:0,seasons:null});
+      }
+      if(items.length&&plan[k].season>0)break;   // 带季数时，剥季片名已经命中就够，不必再查去标点版本
+    }
+    if(!items.length)return{list:[]};
+    let meta={title:q.title||raw,season:q.season};
+    // 目标季优先：剥季片名命中且确实是剧集的排最前
+    let ranked=spSortByScore(items,meta);
+    return{list:ranked.map(o=>{
+      let $=o.raw,isS=$.Type==="Series";
+      // ★ 只有「片名一致」的剧集才打「第 N 季」标记，避免把同名无关条目也标季
+      let ws=meta.season>0&&isS&&spSame($.Name,meta.title);
+      return{vod_id:ws?Xmi($.Id,{season:meta.season}):$.Id,vod_name:$.Name,vod_pic:P($.Id,$.ImageTags?.Primary,{},ce),vod_remarks:(ws?"\u7B2C "+meta.season+" \u5B63 \u00B7 ":"")+(isS?"\u5267\u96C6":"\u7535\u5F71"),vod_year:$.ProductionYear||""};
+    })}
+  }catch{return{list:[],error:"\u641C\u7D22\u5931\u8D25"}}
+}    /* 取某条目的播放信息（MediaSources）。带 MediaSourceId 时 Emby 只回那一个版本，不带时回全部 */
+    async function playbackSources(itemId, hdr, msId) {
+      var body = { DeviceProfile: { MaxStreamingBitrate: 14e7, DirectPlayProfiles: [{ Container: "mp4,mkv,m4v", Type: "Video" }] } }
+      var params = { UserId: t.userId, MaxStreamingBitrate: 14e7 }
+      if (msId) params.MediaSourceId = msId
+      var r = await tt.post(n(`/Items/${itemId}/PlaybackInfo`), body, { headers: { ...hdr, "Content-Type": "application/json" }, params: params, timeout: 8e3 })
+      return (r && r.data && r.data.MediaSources) || []
+    }
+    /* 该条目的全部版本：先不带 MediaSourceId 问一次；仍只有一个就按条目的 MediaSources 逐个问 */
+    async function allPlaybackSources(itemId, hdr, wantId, seed) {
+      var best = Array.isArray(seed) ? seed.slice() : []
+      try {
+        var full = await playbackSources(itemId, hdr, null)
+        if (full.length > best.length) best = full
+      } catch (e) {}
+      if (best.length > 1) return best
+      var metas = []
+      try {
+        var d = await s.cachedGet(n(`/Users/${t.userId}/Items/${itemId}`), { headers: hdr, params: { Fields: "MediaSources" } }, "long")
+        metas = (d && d.data && d.data.MediaSources) || []
+      } catch (e) {}
+      if (!Array.isArray(metas) || metas.length < 2) return best
+      var got = await Promise.all(metas.map(function (m) { return playbackSources(itemId, hdr, m.Id).catch(function () { return [] }) }))
+      var merged = []
+      got.forEach(function (arr) { if (arr && arr.length) merged.push(arr[0]) })
+      return merged.length > best.length ? merged : best
+    }
+    function pickSource(list, wantId) {
+      if (!Array.isArray(list) || !list.length) return null
+      for (var k = 0; k < list.length; k++) if (wantId && list[k] && list[k].Id === wantId) return list[k]
+      return list[0]
+    }
+    async function ie(ce, Z) {
+      var ae = String((ce.body && ce.body.id) || "")
+      if (!ae) return { parse: 1, url: "", header: i }
+      if (ae.endsWith("_more")) {
+        var jm = ae.replace("_more", "")
+        return { parse: 0, url: `${t.server}/web/index.html#!/details?id=${jm}&serverId=${t.server}`, header: i }
+      }
+      var fe, H
+      if (ae.includes("|")) {
+        var parts = ae.split("|")
+        fe = parts[0]
+        H = parts[1]
+      } else if (ae.includes("/PlaybackInfo?")) {
+        try {
+          var u = new URL(ae)
+          var seg = u.pathname.split("/")
+          fe = seg[seg.length - 2]
+          H = u.searchParams.get("MediaSourceId")
+        } catch (e) {
+          return { parse: 1, url: ae, header: i }
+        }
+      } else return { parse: 1, url: ae, header: i }
+      try {
+        var hdr = await a()
+        var sources = await playbackSources(fe, hdr, H)
+        if (!sources.length) return { error: "无可用媒体源" }
+        var primary = pickSource(sources, H)
+        var sid = null
+        var startSession = function (src) {
+          if (t.enablePlaybackReport && src) o.recordPlaybackStart(fe, src).then(function (x) { sid = x }).catch(function () {})
+        }
+        /* 详情页来的 id（集ID|版本ID、电影ID）：统一在播放页给出「多画质线路」。
+           注意 Emby 带 MediaSourceId 的 PlaybackInfo 只返回那一个版本，所以要再补一次全量查询 */
+        if (!ae.includes("/PlaybackInfo?")) {
+          var all = await allPlaybackSources(fe, hdr, H, sources)
+          /* 剧集详情页不给版本选择，所以不用 H 指定版本：交给 embyQualityLines 按画质自动排序（默认最高） */
+          primary = all.length > 1 ? null : pickSource(all, H)
+          startSession(primary || all[0])
+          var ql = embyQualityLines(fe, all, primary, sid)
+          if (ql) return ql
+          var one = de(primary, sid)
+          return one || { parse: 0, url: Jmi(t, primary), header: i, extra: { mediaSourceId: primary.Id, playbackSessionId: sid } }
+        }
+        startSession(primary)
+        var single = de(primary, sid)
+        return single || { parse: 0, url: Jmi(t, primary), header: i, extra: { mediaSourceId: primary.Id, playbackSessionId: sid } }
+      } catch (e) {
+        console.debug("播放请求失败:", e.message)
+        return { parse: 0, url: t.isJellyfin ? `${t.server}/Videos/${fe}/stream?api_key=${t.token}` : `${t.server}/emby/videos/${fe}/stream?api_key=${t.token}`, header: i }
+      }
+    }
+    /* Emby 画质/版本标签（去掉会破坏线路分隔符的 $ 与 #） */
+    function embySourceDesc(src){
+      var hh=Number(src&&src.Height||0),ww=Number(src&&src.Width||0)
+      var br=Number(src&&src.Bitrate||0),vc=String(src&&src.VideoCodec||"").trim().toUpperCase()
+      var parts=[]
+      if(hh)parts.push(hh+"p");else if(ww)parts.push(ww+"p")
+      if(br)parts.push((br/1e6).toFixed(1)+"M")
+      if(vc)parts.push(vc)
+      return parts.join(" · ")
+    }
+    function embyQualityLabel(src,idx){
+      var nm=String(src&&src.Name||"").trim()
+      if(/^(默认|default)$/i.test(nm))nm=""
+      var label=nm||embySourceDesc(src)||("版本"+(idx+1))
+      if(label.length>48)label=label.slice(0,48).trim()
+      return label.replace(/[$#]/g," ")
+    }
+    /* 媒体源 → 可直链播放的地址：优先 DirectStreamUrl（带会话），退回原文件静态流（必须带 MediaSourceId） */
+    function embySourceUrl(itemId, src, sid) {
+      var one = de(src, sid)
+      if (one && one.url) return one.url
+      var path = t.isJellyfin
+        ? `/Videos/${encodeURIComponent(itemId)}/stream?static=true`
+        : `/emby/videos/${encodeURIComponent(itemId)}/original?Static=true`
+      var url = t.server + path + "&api_key=" + encodeURIComponent(t.token)
+      if (src && src.Id) url += "&MediaSourceId=" + encodeURIComponent(src.Id)
+      return url
+    }
+    /* 多画质：把该条目的全部 MediaSources 做成播放页「画质线路」数组（CatVod 多线路格式） */
+    function embyQualityLines(itemId, list, primary, sid) {
+      if (!Array.isArray(list) || list.length < 2) return null
+      if (!primary) {
+        /* 没指定版本时默认最高画质：分辨率优先，其次码率 */
+        var auto = list.slice().sort(function (a, b) {
+          var ha = Number((a && a.Height) || 0), hb = Number((b && b.Height) || 0)
+          return ha !== hb ? hb - ha : Number((b && b.Bitrate) || 0) - Number((a && a.Bitrate) || 0)
+        })
+        primary = auto[0]
+      }
+      /* 主源保持第一（详情页选中的那个版本默认起播），其余按分辨率/码率降序 */
+      var rest = list.filter(function (x) { return x !== primary })
+      rest.sort(function (a, b) {
+        var ha = Number((a && a.Height) || 0), hb = Number((b && b.Height) || 0)
+        return ha !== hb ? hb - ha : Number((b && b.Bitrate) || 0) - Number((a && a.Bitrate) || 0)
+      })
+      var order = [primary].concat(rest), arr = [], seenUrl = {}, usedLabel = {}
+      for (var k = 0; k < order.length; k++) {
+        var src = order[k], url = ""
+        try { url = embySourceUrl(itemId, src, src === primary ? sid : null) } catch (e) { url = "" }
+        if (!url || seenUrl[url]) continue
+        seenUrl[url] = 1
+        var label = embyQualityLabel(src, arr.length / 2), base = label, dup = 2
+        /* 重名时补上分辨率/码率，仍重名才加序号 */
+        if (usedLabel[label]) {
+          var desc = embySourceDesc(src)
+          if (desc && label.indexOf(desc) < 0) label = (base + " · " + desc).slice(0, 64)
+        }
+        while (usedLabel[label]) label = base + " #" + dup++
+        usedLabel[label] = 1
+        arr.push(label, url)
+      }
+      if (arr.length < 4) return null
+      try { console.log("[emby] play 多画质 " + arr.length / 2 + " 条：" + arr.filter(function (x, i2) { return i2 % 2 === 0 }).join(" / ")) } catch (e) {}
+      return {
+        code: 0, parse: 0, url: arr, urls: arr, header: i,
+        extra: {
+          source: embyQualityLabel(primary || order[0], 0),
+          bitrate: primary && primary.Bitrate ? (primary.Bitrate / 1e6).toFixed(1) + "M" : "",
+          mediaSourceId: primary.Id,
+          playbackSessionId: sid,
+          message: "共 " + arr.length / 2 + " 个画质/版本，可在播放页切换",
+        },
+      }
+    }
+
+    function de(ce,Z){return ce.DirectStreamUrl?{parse:0,url:ce.DirectStreamUrl.startsWith("http")?ce.DirectStreamUrl:t.server+ce.DirectStreamUrl,header:{...i,Referer:`${t.server}/`,...Z&&{"X-Playback-Session-Id":Z}},extra:{source:ce.Name||"\u9ED8\u8BA4",bitrate:ce.Bitrate?`${(ce.Bitrate/1e6).toFixed(1)}M`:"",mediaSourceId:ce.Id,playbackSessionId:Z}}:ce.Path&&ce.Path.startsWith("http")?{parse:0,url:ce.Path,header:i,extra:{mediaSourceId:ce.Id,playbackSessionId:Z}}:null}return{meta:{key:`emby_${t.id}`,name:`${t.isJellyfin?"Jellyfin":"Emby"} ${t.name}`,type:3,version:"0.0.3"},api:async ce=>{ce.get("/proxy/image",L),ce.post("/init",F),ce.post("/home",Q),ce.post("/category",z),ce.post("/detail",re),ce.post("/play",ie),ce.post("/search",se)}}}br();On();au();ko();var wQe="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",Yue=3e4,Zmi=1e4,ehi=new Set(["desktop.ini","thumbs.db","readme.md"]),RQe=1e3,thi=5e3,rhi=/\.(mp4|mkv|avi|mov|flv|wmv|m3u8|ts|rmvb|webm|m4v|mpg|mpeg|3gp|iso)$/i,nhi="https://img.icons8.com/color/48/folder-invoices.png",ihi="https://img.icons8.com/fluency/96/video-file.png",ahi="",y7r="__alist_playlist__",_7r="https://img.icons8.com/fluency/96/playlist.png",shi={mp4:"video/mp4",m4v:"video/mp4",mkv:"video/x-matroska",avi:"video/x-msvideo",mov:"video/quicktime",flv:"video/x-flv",wmv:"video/x-ms-wmv",m3u8:"application/vnd.apple.mpegurl",ts:"video/MP2T",webm:"video/webm",mpg:"video/mpeg",mpeg:"video/mpeg","3gp":"video/3gpp"},ohi={srt:"text/plain; charset=utf-8",ass:"text/plain; charset=utf-8",ssa:"text/plain; charset=utf-8",sub:"text/plain; charset=utf-8",idx:"text/plain; charset=utf-8",smi:"text/plain; charset=utf-8",txt:"text/plain; charset=utf-8",vtt:"text/vtt; charset=utf-8"};function chi(e="",t=""){let r=String(e),n=String(t),i=r.match(/(\d+|\D+)/g)||[],a=n.match(/(\d+|\D+)/g)||[],s=Math.min(i.length,a.length);for(let o=0;o<s;o++){let c=i[o],u=a[o],l=/^\d+$/.test(c),x=/^\d+$/.test(u);if(l&&x){let f=Number(c)-Number(u);if(f!==0)return f;continue}let d=c.localeCompare(u);if(d!==0)return d}return i.length-a.length||r.localeCompare(n)}function uhi(){try{if(typeof Intl<"u"&&Intl&&typeof Intl.Collator=="function"){let e=new Intl.Collator("zh-Hans-CN",{numeric:!0,sensitivity:"base"});return(t,r)=>e.compare(t,r)}}catch{}return chi}var A7r=uhi();function Xue(e=""){try{return decodeURIComponent(e)}catch{return e}}function Que(e=""){let r=String(e).trim().replace(/[?#].*$/,"").replace(/\/+$/,"").split("/").filter(Boolean);return r.length>0?r[r.length-1]:""}function lhi(e="",t=""){let r=Xue(String(e).trim()),n=Xue(String(t).trim()),i=Que(r);if(i)return i;let a=Que(n);return a||r||n||"\u672A\u77E5\u89C6\u9891"}function b7r(e=""){return Buffer.from(String(e),"utf8").toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"")}function v7r(e=""){let t=String(e||"").replace(/-/g,"+").replace(/_/g,"/"),r=t+"=".repeat((4-t.length%4)%4);return Buffer.from(r,"base64").toString("utf8")}function E7r(e){let t=String(e?.headers?.["x-forwarded-proto"]||e?.protocol||"http").split(",")[0].trim()||"http",r=String(e?.headers?.["x-forwarded-host"]||e?.headers?.host||"").split(",")[0].trim();return r?`${t}://${r}`:e?.server?.address?.()?.url||""}function S7r(e){return String(e?.server?.prefix||"").replace(/\/+$/,"")}function T7r(e=""){let t=String(e||"").toLowerCase().match(/\.([a-z0-9]+)(?:[?#].*)?$/);return t?t[1]:""}function xhi(e=""){return shi[T7r(e)]||"application/octet-stream"}function w7r(e){let t=String(e.id||"unknown"),r=(e.server||"").replace(/\/$/,"");r=r.replace(/:443$/,"").replace(/(:443)\//,"/"),r=r.replace(/^http:\/\/([^:\/]+):80$/,"http://$1"),r=r.replace(/^http:\/\/([^:\/]+):80\//,"http://$1/");let n={id:t,name:e.name||`Alist ${t.slice(0,8)}`,server:r,username:e.username||"",password:e.password||"",token:e.token||"",enabled:e.enabled!==!1},i=n.server,a=null;function s(H,j="",ne={}){return JSON.stringify({c:n.id,p:H||"",n:j,...ne})}function o(H){try{return JSON.parse(H)}catch{return{c:n.id,p:H||"/",n:""}}}function c(){let H={"Content-Type":"application/json","User-Agent":wQe};return n.token&&(H.Authorization=n.token),H}async function u(){if(!n.username)return null;if(a)return a;a=(async()=>{try{let H=await tt.post(`${i}/api/auth/login`,{username:n.username,password:n.password||""},{timeout:Yue});if(H.data?.code===200&&H.data?.data?.token)return n.token=H.data.data.token,n.token;console.error(`[Alist\u767B\u5F55] \u767B\u5F55\u5931\u8D25: ${n.name}, \u54CD\u5E94\u7801: ${H.data?.code}`)}catch(H){console.error(`[Alist\u767B\u5F55] \u767B\u5F55\u5F02\u5E38: ${n.name}, \u9519\u8BEF: ${H.message}`)}return null})();try{return await a}finally{a=null}}function l(H,j){let ne=H?.data?.code||j?.response?.status,O=String(H?.data?.message||j?.response?.data?.message||"").toLowerCase();return ne===401||ne===403||O.includes("token")||O.includes("unauthorized")}async function x(H,j){let ne=()=>tt.post(`${i}${H}`,j,{headers:c(),timeout:Yue});try{let O=await ne();return l(O,null)&&n.username&&await u()?await ne():O}catch(O){if(n.username&&l(null,O)&&await u())return await ne();throw O}}async function d(){return n.token?!0:n.username?!!await u():!0}async function f(H,j=1,ne=RQe,O={}){let U=Math.max(1,Number.parseInt(j,10)||1),$=Math.min(RQe,Math.max(1,Number.parseInt(ne,10)||RQe)),V=Math.max($,Number.parseInt(O.maxItems,10)||thi),K=[],G=U,ee=0;try{for(;K.length<V;){let Y=await x("/api/fs/list",{path:H||"/",password:"",page:G,per_page:$,refresh:!1});if(Y.data?.code!==200){console.error(`[Alist\u5217\u8868] \u5931\u8D25: ${H}, \u54CD\u5E94\u7801: ${Y.data?.code}, \u6D88\u606F: ${Y.data?.message}`);break}let J=Y.data.data||{},q=Array.isArray(J.content)?J.content:[];if(ee=Number(J.total||J.count||ee||0),K.push(...q),q.length<$||ee>0&&K.length>=ee)break;G+=1}}catch(Y){console.error(`[Alist\u5217\u8868] \u5F02\u5E38: ${H}, \u9519\u8BEF: ${Y.message}`)}return K.slice(0,V)}async function p(H){try{let j=await x("/api/fs/get",{path:H||"/",password:""});if(j.data?.code===200)return j.data.data;console.error(`[Alist\u6587\u4EF6] \u5931\u8D25: ${H}, \u54CD\u5E94\u7801: ${j.data?.code}, \u6D88\u606F: ${j.data?.message}`)}catch(j){console.error(`[Alist\u6587\u4EF6] \u5F02\u5E38: ${H}, \u9519\u8BEF: ${j.message}`)}return null}function m(H){if(!H)return"";let O=(H.startsWith("/")?H:`/${H}`).split("/").map(U=>U===""?"":encodeURIComponent(U).replace(/%2F/g,"/")).join("/");return`${i}/d${O}`}function g(H,j,ne){let O=b7r(JSON.stringify({c:n.id,p:j||"",n:ne||""})),U=T7r(ne),$=`${S7r(H)}/proxy/media/${O}${U?`.${U}`:""}`,V=E7r(H);return V?`${V}${$}`:$}function h(H=""){let j=S(H);return ohi[j]||"text/plain; charset=utf-8"}function _(H,j,ne,O=""){let U=S(O||ne),$=b7r(JSON.stringify({c:n.id,p:j||"",n:ne||"",f:U})),V=`${S7r(H)}/proxy/subtitle/${$}.${U}`,K=E7r(H);return K?`${K}${V}`:V}function y(H,j){let ne=String(H||"/");return ne==="/"?`/${j}`:`${ne}/${j}`}function A(H){return!!H&&rhi.test(H)}function v(H){return Yt(H)}function S(H){return ur(H)||String(H||"").toLowerCase().replace(/^\./,"")||"srt"}function R(H){return String(H||"\u64AD\u653E").replace(/\.[^.]+$/,"").replace(/<|>|《|》/g,"").replace(/\$|#/g," ").trim()||"\u64AD\u653E"}function w(H,j=0){let ne=Number(j||0);return ne>0?`${R(H)}  [${F(ne)}]`:R(H)}function C(H){return String(H||"/").split("/").filter(Boolean).pop()||"\u6839\u76EE\u5F55"}function N(H){let j=Array.isArray(H)?H.filter(O=>O?.url).map(O=>({url:O.url,name:O.name||"\u5916\u6302\u5B57\u5E55",format:S(O.format||O.name)})):[];if(j.length===0)return{};let ne=j[0];return{subt:ne.url,subtitle:ne.url,subs_urls:j.map(O=>O.url),subs:j,extra:{subt:ne.url,subtitle:ne.url,subs_urls:j.map(O=>O.url),subs:j}}}function k(H,j){let O=(Array.isArray(H)?H:H?[H]:[]).map(U=>{let $=U?.name||"",V=U?.path||(j==="/"?`/${$}`:`${j}/${$}`);return!$||!V?null:{p:V,n:$,e:S($)}}).filter(Boolean);return O.length===0?{}:{ss:O}}function P(H,j,ne,O,U=0){return s(H,j,{...k(ne,O),s:Number(U||0)})}async function L(H){let j=await p(H);return j&&j.raw_url?{fileInfo:j,url:j.raw_url,urlSource:"raw_url"}:j&&j.url?{fileInfo:j,url:j.url,urlSource:"url"}:{fileInfo:j,url:m(H),urlSource:"direct_link"}}function F(H){if(!H||H===0)return"0B";let j=1024,ne=["B","KB","MB","GB","TB"],O=Math.floor(Math.log(H)/Math.log(j));return parseFloat((H/Math.pow(j,O)).toFixed(2))+ne[O]}async function Q(H,j){try{if(!n.server)return{success:!1,error:"\u670D\u52A1\u5668\u5730\u5740\u672A\u914D\u7F6E"};if(n.username&&!n.token&&!await d())return{success:!1,error:"\u767B\u5F55\u5931\u8D25"};let ne=await x("/api/fs/list",{path:"/",password:"",page:1,per_page:1});return ne.data?.code!==200?{success:!1,error:ne.data?.message||"\u8FDE\u63A5\u6821\u9A8C\u5931\u8D25",message:`\u8FDE\u63A5\u5931\u8D25: ${ne.data?.message||"\u8FDE\u63A5\u6821\u9A8C\u5931\u8D25"}`}:{success:!0,name:n.name,message:`\u8FDE\u63A5\u6210\u529F: ${n.name}`}}catch(ne){return{success:!1,error:ne.message,message:`\u8FDE\u63A5\u5931\u8D25: ${ne.message}`}}}async function z(H,j){let ne=kr("alist",arguments[0]||{}),O=Pr(ne);if(O)return O;let U={class:[{type_id:s("/",""),type_name:n.name,type_flag:"alist"}],filters:{}};return Lr(ne,U,Ut.semiStatic),U}async function re(H,j){let ne=H.body||{},O="/",U=null;ne.id&&(U=o(ne.id),O=U.p||"/");let $=parseInt(ne.page)||1,V=50;if(!await d())return{page:1,pagecount:1,limit:V,total:0,list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let G=(await f(O,1,1e3)).filter(De=>{let Be=De?.name||"";return Be&&!Be.startsWith(".")&&!ehi.has(Be.toLowerCase())}),ee=[],Y=[],J=[];G.forEach(De=>{let Be=y(O,De.name);De.is_dir?ee.push({...De,path:Be,type:"folder"}):(Y.push({...De,path:Be,type:"file",isVideo:A(De.name)}),v(De.name)&&J.push({...De,path:Be}))}),ee.sort((De,Be)=>A7r(De.name,Be.name));let q=Rr(Y.filter(De=>De.isVideo)),te=new Set(q.map(De=>De.path)),le=Y.filter(De=>!te.has(De.path)).sort((De,Be)=>A7r(De.name,Be.name)),ye=[...ee];q.length>1&&ye.push({isPlaylist:!0,path:O,name:"\u64AD\u653E\u5217\u8868",count:q.length}),ye.push(...q,...le);let Te=($-1)*V,Ie=Te+V,Ve=ye.slice(Te,Ie).map(De=>{if(De.isPlaylist){let Be=s(De.path,y7r,{t:`${C(De.path)} \u64AD\u653E\u5217\u8868`});return{vod_id:Be,vod_name:"\u64AD\u653E\u5217\u8868",vod_pic:_7r,vod_remarks:`${De.count}\u4E2A\u89C6\u9891`,vod_tag:"playlist",vod_content:"",extend:{id:Be,path:De.path,type:"playlist"}}}if(De.is_dir){let Be=s(De.path,"");return{vod_id:Be,type_id:Be,type_name:De.name,vod_name:`\u{1F4C1} ${De.name}`,vod_pic:"https://img.icons8.com/color/48/folder-invoices.png",vod_remarks:"\u6587\u4EF6\u5939",vod_tag:"folder",vod_content:"",cate:{id:Be,name:De.name},extend:{id:Be,path:De.path,type:"folder"}}}else{let Be=De.isVideo?fo(De.name,J,ve=>ve?.name||""):[],we=P(De.path,De.name,Be,O,De.size),ge=[];return De.isVideo&&ge.push("\u{1F3AC}"),De.size&&ge.push(F(De.size)),{vod_id:we,vod_name:De.name,vod_pic:De.thumb||"",vod_remarks:ge.join(" "),vod_tag:De.isVideo?"video":"file",vod_content:"",extend:{id:we,path:De.path,type:"file",isVideo:De.isVideo}}}});return{page:$,pagecount:Math.max(1,Math.ceil(ye.length/V)),limit:V,total:ye.length,list:Ve}}catch(K){return console.error("Alist\u5206\u7C7B\u5931\u8D25:",K),{page:1,pagecount:1,limit:V,total:0,list:[],error:K.message}}}async function se(H,j){let ne=H.body||{};if(!ne.id)return{list:[],error:"ID\u53C2\u6570\u7F3A\u5931"};if(!await d())return{list:[],error:"\u767B\u5F55\u5931\u8D25"};try{let O=o(ne.id);if(!O.n)return{list:[],error:"\u76EE\u5F55\u65E0\u6CD5\u67E5\u770B\u8BE6\u60C5\uFF0C\u8BF7\u4F7F\u7528\u5206\u7C7B\u6D4F\u89C8"};let U=O.p;if(O.n===y7r){let V=await f(U),K=V.filter(Y=>!Y.is_dir&&v(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})),G=Rr(V.filter(Y=>!Y.is_dir&&A(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})));if(G.length===0)return{list:[],error:"\u6587\u4EF6\u5939\u4E2D\u6CA1\u6709\u89C6\u9891\u6587\u4EF6"};let ee=G.map(Y=>{let J=fo(Y.name,K,te=>te?.name||""),q=P(Y.path,Y.name,J,U,Y.size);return`${w(Y.name,Y.size)}$${q}`}).join("#");return{list:[{vod_id:ne.id,vod_name:O.t||`${C(U)} \u64AD\u653E\u5217\u8868`,vod_pic:_7r,vod_content:`\u5F53\u524D\u76EE\u5F55: ${U}`,vod_remarks:`\u5171${G.length}\u4E2A\u89C6\u9891`,vod_play_from:n.name,vod_play_url:ee}]}}let $=await p(U);if(!$)return{list:[],error:"\u6587\u4EF6\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u8BBF\u95EE"};if($.is_dir){let V=await f(U),K=V.filter(Y=>!Y.is_dir&&v(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})),G=Rr(V.filter(Y=>!Y.is_dir&&A(Y.name)).map(Y=>({...Y,path:y(U,Y.name)})));if(G.length===0)return{list:[],error:"\u6587\u4EF6\u5939\u4E2D\u6CA1\u6709\u89C6\u9891\u6587\u4EF6"};let ee=G.map(Y=>{let J=fo(Y.name,K,te=>te?.name||""),q=P(Y.path,Y.name,J,O.p,Y.size);return`${w(Y.name,Y.size)}$${q}`}).join("#");return{list:[{vod_id:ne.id,vod_name:O.n,vod_pic:$.thumb||"",vod_content:"",vod_remarks:F($.size)||"",vod_play_from:n.name,vod_play_url:ee}]}}else{if(!A($.name))return{list:[],error:"\u4E0D\u662F\u89C6\u9891\u6587\u4EF6"};let V=U.substring(0,U.lastIndexOf("/"))||"/",G=(await f(V)).filter(q=>!q.is_dir&&v(q.name)).map(q=>({...q,path:y(V,q.name)})),ee=fo(O.n,G,q=>q?.name||""),Y=P(U,O.n,ee,V,$.size),J="";return ee.length>0&&(J=`\u5B57\u5E55\u6587\u4EF6:
 ${ee.map(te=>te.name).join(`
 `)}`),{list:[{vod_id:ne.id,vod_name:O.n,vod_pic:$.thumb||"",vod_content:J,vod_remarks:F($.size)||"",vod_time:$.modified||"",vod_play_from:n.name,vod_play_url:`${w(O.n,$.size)}$${Y}`}]}}}catch(O){return console.error("Alist\u8BE6\u60C5\u5931\u8D25:",O),{list:[],error:O.message}}}async function ie(H,j){let ne=H.body||{};if(!ne.id)return{error:"ID\u53C2\u6570\u7F3A\u5931"};if(!await d())return{error:"\u767B\u5F55\u5931\u8D25"};try{let O=o(ne.id),U=O.n||(O.p?O.p.split("/").pop():"")||"";if(!A(U))return{error:"\u4E0D\u662F\u89C6\u9891\u6587\u4EF6\uFF0C\u65E0\u6CD5\u64AD\u653E"};let $=O.p,{url:V,urlSource:K}=await L($);if(!V)throw new Error("\u65E0\u6CD5\u83B7\u53D6\u64AD\u653E\u5730\u5740");let G={parse:0,url:g(H,$,U),header:{},extra:{from:n.name,path:$,urlSource:K}},ee=Array.isArray(O.ss)&&O.ss.length>0?O.ss.map(Y=>({path:Y?.p||"",name:Y?.n||"\u5916\u6302\u5B57\u5E55",format:Y?.e||Y?.n||"srt"})).filter(Y=>Y.path):O.sp?[{path:O.sp,name:O.sn||"\u5916\u6302\u5B57\u5E55",format:O.se||O.sn||"srt"}]:[];if(ee.length>0)try{let Y=[];for(let te of ee)try{let le=_(H,te.path,te.name,te.format);le&&Y.push({url:le,name:te.name||"\u5916\u6302\u5B57\u5E55",format:te.format||te.name||"srt"})}catch(le){console.warn("[Alist\u64AD\u653E] \u5B57\u5E55\u52A0\u8F7D\u5931\u8D25:",le.message)}let J=N(Y),q={...G.extra||{},...J.extra||{}};Object.assign(G,J),G.extra=q}catch(Y){console.warn("[Alist\u64AD\u653E] \u5B57\u5E55\u52A0\u8F7D\u5931\u8D25:",Y.message)}return G}catch(O){return console.error("[Alist\u64AD\u653E] \u64AD\u653E\u5931\u8D25:",O.message,O.stack),{parse:0,url:"",header:{},error:O.message}}}function de(H,j={}){let ne={"User-Agent":wQe,...j},O=String(H).startsWith(`${i}/`);return O&&(ne.Referer=i),O&&n.token&&(ne.Authorization=n.token.startsWith("Bearer ")?n.token:`Bearer ${n.token}`),ne}async function xe(H,j){let ne=String(H.params?.encoded||H.params?.["*"]||"").replace(/\.[a-z0-9]+$/i,""),O=null;try{O=JSON.parse(v7r(ne))}catch{return j.code(400),"bad media token"}if(!O||O.c!==n.id||!O.p)return j.code(403),"invalid media token";try{let U=String(O.p||""),$=String(O.n||Que(U)||"video"),{url:V}=await L(U);if(!V)return j.code(404),"media url not found";let K=de(V,{Accept:"*/*","Accept-Encoding":"identity",...H.headers?.range?{Range:H.headers.range}:{}}),G=await tt.get(V,{responseType:"stream",headers:K,timeout:Yue,maxRedirects:5,validateStatus:()=>!0});if(G.status<200||G.status>=400)return G.data&&typeof G.data.destroy=="function"&&G.data.destroy(),j.code(G.status||502),`media fetch failed: ${G.status||502}`;j.code(G.status||200);let ee=["content-type","content-length","content-range","accept-ranges","etag","last-modified"];for(let J of ee){let q=G.headers?.[J];q!=null&&j.header(J,q)}let Y=String(G.headers?.["content-type"]||"").toLowerCase();return(!Y||Y.includes("application/oct-stream")||Y.includes("application/octet-stream"))&&j.header("Content-Type",xhi($)),j.header("Accept-Ranges",G.headers?.["accept-ranges"]||"bytes"),j.header("Access-Control-Allow-Origin","*"),j.header("Access-Control-Allow-Headers","Range, Content-Type"),j.header("Access-Control-Expose-Headers","Content-Length, Content-Range, Accept-Ranges"),j.header("Cache-Control","no-store"),j.send(G.data)}catch(U){return console.error("[Alist\u4EE3\u7406] \u5A92\u4F53\u4EE3\u7406\u5931\u8D25:",U.message),j.code(502),`media proxy failed: ${U.message}`}}async function ce(H,j){let ne=String(H.params?.encoded||H.params?.["*"]||"").replace(/\.[a-z0-9]+$/i,""),O=null;try{O=JSON.parse(v7r(ne))}catch{return j.code(400),"bad subtitle token"}if(!O||O.c!==n.id||!O.p)return j.code(403),"invalid subtitle token";try{let U=String(O.p||""),$=String(O.n||Que(U)||"subtitle.srt"),V=S(O.f||$),{url:K}=await L(U);if(!K)return j.code(404),"subtitle url not found";let G=await tt.get(K,{responseType:"stream",headers:de(K,{Accept:"text/plain,text/vtt,*/*","Accept-Encoding":"identity"}),timeout:Yue,maxRedirects:5,validateStatus:()=>!0});if(G.status<200||G.status>=400)return G.data&&typeof G.data.destroy=="function"&&G.data.destroy(),j.code(G.status||502),`subtitle fetch failed: ${G.status||502}`;j.code(G.status||200);let ee=String(G.headers?.["content-type"]||"").toLowerCase();return j.header("Content-Type",ee&&!ee.includes("application/octet-stream")?G.headers["content-type"]:h(V)),G.headers?.["content-length"]&&j.header("Content-Length",G.headers["content-length"]),j.header("Access-Control-Allow-Origin","*"),j.header("Access-Control-Allow-Headers","Range, Content-Type"),j.header("Access-Control-Expose-Headers","Content-Length, Content-Range, Accept-Ranges"),j.header("Cache-Control","no-store"),j.send(G.data)}catch(U){return console.error("[Alist\u4EE3\u7406] \u5B57\u5E55\u4EE3\u7406\u5931\u8D25:",U.message),j.code(502),`subtitle proxy failed: ${U.message}`}}async function Z(H,j){let ne=H.body||{},O=ne.wd||"",U=parseInt(ne.page,10)||1;if(!O.trim())return{page:1,pagecount:1,limit:0,total:0,list:[]};try{let $=`${i}/search?box=${encodeURIComponent(O)}&type=video`,V=await tt.get($,{timeout:Zmi,headers:{"User-Agent":wQe}});if(!V.data)return{page:1,pagecount:1,limit:0,total:0,list:[]};let G=new sqe().pq(V.data),ee=[];G("div ul a").each((J,q)=>{let te=q.attribs?.href,le=G(q).text().trim();te&&le&&te.startsWith("/")&&ee.push({path:Xue(te),name:Xue(le)})});let Y=ee.map(J=>{let q=lhi(J.name,J.path),te=A(q)||A(J.path),le=s(J.path,te?q:""),ye={vod_id:le,vod_name:q,vod_pic:te?ihi:nhi,vod_remarks:te?"\u89C6\u9891\u6587\u4EF6":"\u6587\u4EF6\u5939",vod_tag:te?"video":"folder",vod_content:J.path,extend:{id:le,path:J.path,type:te?"file":"folder",isVideo:te}};return te?(ye.vod_play_from=n.name,ye.vod_play_url=`${q}$${le}`):(ye.type_id=le,ye.type_name=q,ye.cate={id:le,name:q}),ye});return{page:U,pagecount:1,limit:Y.length,total:Y.length,list:Y}}catch($){return console.error(`[Alist\u641C\u7D22] ${n.name} - \u5931\u8D25:`,$.message),{page:1,pagecount:1,limit:0,total:0,list:[]}}}async function ae(H,j){try{let ne=Buffer.from(ahi,"base64");return j.header("Content-Type","image/png"),j.header("Content-Length",ne.length),j.send(ne)}catch{j.code(500).send({error:"Failed to load image"})}}return{meta:{key:`alist_${n.id}`,name:`Alist ${n.name}`,type:3,version:"2.1.0",author:"\u878D\u5408\u7248\u672C",description:`Alist\u6587\u4EF6\u6D4F\u89C8 - ${n.name}`,supportSearch:!0},api:async H=>{H.post("/init",Q),H.post("/home",z),H.post("/category",re),H.post("/detail",se),H.post("/play",ie),H.post("/search",Z),H.get("/icon",ae),H.get("/proxy/media/*",xe),H.get("/proxy/subtitle/*",ce)}}}br();On();var Dtt=Pe(Ott(),1);_o();Es();ko();au();function ktt(e){let t=(e.server||"").replace(/\/$/,"");t=t.replace(/:443$/,"").replace(/(:443)\//,"/"),t=t.replace(/^http:\/\/([^:\/]+):80$/,"http://$1"),t=t.replace(/^http:\/\/([^:\/]+):80\//,"http://$1/");let r={id:e.id,name:e.name||`WebDAV ${e.id.slice(0,8)}`,server:t,path:e.path||"/",username:e.username||"",password:e.password||"",enabled:e.enabled!==!1},n=r.server,i=r.path&&r.path!=="/"?r.path.replace(/\/$/,""):"/",a=15*1e3,s=20*1e3,o=10*1e3,c=5,u=2,l=200,x=50,d=20,f=2*1024*1024,p="1.3.1",m="webdav@@@",g="__webdav_playlist__",h="https://img.icons8.com/color/48/folder-invoices.png",_="https://i2.100024.xyz/2024/01/13/pptcej.webp",y="https://img.icons8.com/fluency/96/playlist.png",A=new vt(l,a),v=new vt(l,s),S=new vt(l,o),R=`webdav:${r.id}`;async function w(ge,ve,Re,be,Ne){let Oe=ge.get(Re);return Oe!==null?Oe:zn(R,ve,Re,async()=>{let Ce=await Ne();return ge.set(Re,Ce),Ce},{timeout:3e4})}function C(ge){let ve=Number.parseInt(ge,10);return Number.isNaN(ve)||ve<=0?1:ve}function N(ge,ve="",Re={}){let be={c:r.id,p:ge||"/",n:ve||""};if(Re&&typeof Re=="object")for(let[Ne,Oe]of Object.entries(Re))["c","p","n"].includes(Ne)||Oe==null||Oe===""||(be[Ne]=Oe);return m+Buffer.from(JSON.stringify(be),"utf8").toString("base64url")}function k(ge){let ve={c:r.id,p:ge||"/",n:""};try{let Re=typeof ge=="string"?ge:"";if(!Re)return ve;if(Re.includes("%"))try{Re=decodeURIComponent(Re)}catch{}return Re.startsWith(m)?JSON.parse(Buffer.from(Re.slice(m.length),"base64url").toString("utf8")):Re.startsWith("{")?JSON.parse(Re):ve}catch{return ve}}let P=r.username?{Authorization:`Basic ${Buffer.from(`${r.username}:${r.password||""}`).toString("base64")}`,"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}:{};function L(){return{...P}}function F(ge){let ve=String(ge||"/").trim();return ve.startsWith("/")||(ve="/"+ve),i&&i!=="/"&&(ve===i||ve.startsWith(i+"/"))&&(ve=ve.substring(i.length)||"/"),ve.startsWith("/")||(ve="/"+ve),ve.replace(/\/+/g,"/")}function Q(){return(0,Dtt.create)({version:"1.0",encoding:"UTF-8"}).ele("d:propfind",{"xmlns:d":"DAV:"}).ele("d:prop").ele("d:displayname").up().ele("d:getcontentlength").up().ele("d:getcontenttype").up().ele("d:getlastmodified").up().ele("d:resourcetype").up().up().up().end()}let z=Q();function re(ge,ve){let Re=[];try{let be=(0,Dtt.create)(String(ge||"")).node,Ne=Array.from(be.getElementsByTagNameNS("*","response")),Oe=(Dt,Qe)=>Dt.getElementsByTagNameNS("*",Qe)[0]?.textContent||"",Ce=Dt=>{let Qe=String(Dt||"");try{Qe=new URL(Qe,n).pathname}catch{}try{Qe=decodeURIComponent(Qe)}catch{}return Qe},ze=Ce(ve).replace(/\/$/,"");for(let Dt of Ne){let Qe=Ce(Oe(Dt,"href"));if(!Qe||Qe.replace(/\/$/,"")===ze)continue;let Nr=Oe(Dt,"displayname")||Qe.split("/").filter(Boolean).pop();if(!Nr){let _t=Qe.split("/").filter(Boolean);Nr=_t[_t.length-1]||"\u672A\u77E5\u6587\u4EF6"}let tr=Number.parseInt(Oe(Dt,"getcontentlength"),10)||0,Ze=Oe(Dt,"getlastmodified")||null,Ct=Dt.getElementsByTagNameNS("*","collection").length>0,bt=F(Qe),Xt=!Ct&&xe(Nr),Mr=!Ct&&ce(Nr);Re.push({name:Nr,path:bt,size:tr,isDir:Ct,isVideo:Xt,isSubtitle:Mr,lastModified:Ze})}}catch(be){console.error("\u89E3\u6790WebDAV\u54CD\u5E94\u5931\u8D25:",be.message)}return Re}async function se(ge){let ve=i==="/"?ge:i+ge;ve.startsWith("/")||(ve="/"+ve);let Re=n+ve,be=await tt({method:"PROPFIND",url:Re,headers:{...L(),Depth:"1","Content-Type":"application/xml"},data:z,timeout:3e4});return re(be.data,ve)}async function ie(ge,ve={}){let Re=`dir:${ge}`;try{let Ne=(ve.noCache?await se(ge):await w(A,"category",Re,a,async()=>se(ge))).slice();if(ve.sortBy==="name"?Ne.sort((Oe,Ce)=>Oe.isDir&&!Ce.isDir?-1:!Oe.isDir&&Ce.isDir?1:Oe.name.localeCompare(Ce.name)):ve.sortBy==="time"&&ve.sortOrder==="desc"&&Ne.sort((Oe,Ce)=>Oe.lastModified&&Ce.lastModified?new Date(Ce.lastModified)-new Date(Oe.lastModified):0),ve.filter==="videos"?Ne=Ne.filter(Oe=>Oe.isVideo):ve.filter==="folders"&&(Ne=Ne.filter(Oe=>Oe.isDir)),ve.page&&ve.pageSize){let Oe=(ve.page-1)*ve.pageSize;Ne=Ne.slice(Oe,Oe+ve.pageSize)}return Ne}catch(be){throw console.error("WebDAV\u5217\u51FA\u76EE\u5F55\u5931\u8D25:",be.message),be}}async function de(ge){let ve=await ie(ge),Re=ve.filter(Ce=>Ce.isDir),be=ve.filter(Ce=>!Ce.isDir),Ne=be.filter(Ce=>Ce.isVideo),Oe=be.filter(Ce=>Ce.isSubtitle);return{folders:Re,files:be,videoFiles:Ne,subtitleFiles:Oe,total:ve.length}}function xe(ge){return[".mp4",".mkv",".avi",".mov",".flv",".wmv",".m3u8",".ts",".rmvb",".webm",".rm",".mpg",".mpeg",".3gp",".f4v",".vob",".iso"].some(Re=>ge.toLowerCase().endsWith(Re))}function ce(ge){return[".srt",".ass",".ssa",".sub",".idx",".vtt",".smi",".txt"].some(Re=>ge.toLowerCase().endsWith(Re))}function Z(ge){return/\.[^./\\]+$/.test(String(ge||""))}function ae(ge){return String(ge||"\u64AD\u653E").replace(/\.[^.]+$/,"").replace(/<|>|《|》/g,"").replace(/\$|#/g," ").trim()||"\u64AD\u653E"}function fe(ge,ve=0){let Re=Number(ve||0);return Re>0?`${ae(ge)}  [${J(Re)}]`:ae(ge)}function H(ge){let ve=String(ge||"").toLowerCase().replace(/^\./,"");return["srt","ass","ssa","sub","idx","vtt","smi","txt"].includes(ve)?ve:ur(ge)||"srt"}function j(ge){let ve=Array.isArray(ge)?ge.filter(be=>be?.url).map(be=>({url:be.url,name:be.name||"\u5916\u6302\u5B57\u5E55",format:H(be.format||be.name)})):[];if(ve.length===0)return{};let Re=ve[0];return{subt:Re.url,subtitle:Re.url,subs_urls:ve.map(be=>be.url),subs:ve,extra:{subt:Re.url,subtitle:Re.url,subs_urls:ve.map(be=>be.url),subs:ve}}}function ne(ge){return Rr(Array.isArray(ge)?ge.slice():[])}function O(ge,ve){return fo(ge?.name,ve,Re=>Re?.name||"")}function U(ge,ve=[]){let Re=O(ge,ve),be=Re.length>0?{ss:Re.map(Ne=>({p:Ne.path,n:Ne.name,e:H(Ne.name)}))}:{};return N(ge.path,ge.name,be)}function $(ge,ve=[]){return`${fe(ge.name,ge.size)}$${U(ge,ve)}`}function V(ge,ve=[]){return ne(ge).map(Re=>`${fe(Re.name,Re.size)}$${U(Re,ve)}`).join("#")}function K(ge){return ge.split("/").filter(Boolean).pop()||"\u6839\u76EE\u5F55"}function G(ge,ve={}){let Re=i==="/"?ge:i+ge;Re.startsWith("/")||(Re="/"+Re);let Ne=Re.split("/").map(Ce=>Ce===""?"":encodeURIComponent(Ce).replace(/%2F/g,"/")).join("/"),Oe=n+Ne;if(ve.includeCredentialsInUrl&&r.username){let Ce=Oe.split("://")[0],ze=Oe.split("://")[1];Oe=`${Ce}://${encodeURIComponent(r.username)}:${encodeURIComponent(r.password||"")}@${ze}`}return{url:Oe,headers:ve.includeCredentialsInUrl?{}:L()}}async function ee(ge,ve=""){let Re=i==="/"?ge:i+ge;Re.startsWith("/")||(Re="/"+Re);let Ne=Re.split("/").map(Qe=>Qe===""?"":encodeURIComponent(Qe).replace(/%2F/g,"/")).join("/"),Oe=n+Ne,Ce=await tt({method:"GET",url:Oe,headers:L(),responseType:"arraybuffer",transformResponse:[Qe=>Qe],maxContentLength:f,maxBodyLength:f,timeout:15e3}),ze=Buffer.from(Ce.data).toString("base64");return`data:${H(ve)==="vtt"?"text/vtt":"text/plain"};charset=utf-8;base64,${ze}`}async function Y(){try{return await ie("/",{noCache:!0}),!0}catch(ge){return console.error("WebDAV\u8FDE\u63A5\u6D4B\u8BD5\u5931\u8D25:",ge.message),!1}}function J(ge){return!ge||ge===0?"0B":ge<1024?ge+"B":ge<1024*1024?(ge/1024).toFixed(2)+"KB":ge<1024*1024*1024?(ge/1024/1024).toFixed(2)+"MB":(ge/1024/1024/1024).toFixed(2)+"GB"}function q(ge){if(!ge)return"";try{let ve=new Date(ge);return ve.toLocaleDateString()+" "+ve.toLocaleTimeString()}catch{return ge}}async function te(ge,ve){try{return r.server?await Y()?{success:!0,name:r.name,version:p}:{success:!1,error:"\u8FDE\u63A5WebDAV\u670D\u52A1\u5668\u5931\u8D25"}:{success:!1,error:"\u670D\u52A1\u5668\u5730\u5740\u672A\u914D\u7F6E"}}catch(Re){return{success:!1,error:Re.message}}}async function le(ge,ve){let Re=kr("webdav",arguments[0]||{}),be=Pr(Re);if(be)return be;let Ne={class:[{type_id:N("/"),type_name:r.name}]};return Lr(Re,Ne,Ut.semiStatic),Ne}async function ye(ge,ve){let Re=ge.body||{},be=C(Re.pg||Re.page),Ne=x,Oe="/";Re.id&&(Oe=k(Re.id).p||"/");try{let{folders:Ce,files:ze,videoFiles:Dt}=await de(Oe),Qe=Ce.slice().sort((yt,Ht)=>yt.name.localeCompare(Ht.name,"zh-CN")),St=ne(Dt),Nr=new Set(St.map(yt=>yt.path)),tr=ze.filter(yt=>!Nr.has(yt.path)).sort((yt,Ht)=>yt.name.localeCompare(Ht.name,"zh-CN")),Ze=[...Qe.map(yt=>({...yt,isFolder:!0}))];St.length>1&&Ze.push({isPlaylist:!0,path:Oe,name:"\u64AD\u653E\u5217\u8868",count:St.length}),Ze.push(...St.map(yt=>({...yt,isFolder:!1})),...tr.map(yt=>({...yt,isFolder:!1})));let Ct=Ze.length,bt=Math.ceil(Ct/Ne)||1,Xt=(be-1)*Ne,_t=Ze.slice(Xt,Xt+Ne).map(yt=>{if(yt.isPlaylist)return{vod_id:N(yt.path,g,{t:`${K(yt.path)} \u64AD\u653E\u5217\u8868`}),vod_name:"\u64AD\u653E\u5217\u8868",vod_pic:y,vod_remarks:`${yt.count}\u4E2A\u89C6\u9891`,vod_tag:"playlist"};if(yt.isFolder){let Ht=N(yt.path);return{vod_id:Ht,type_id:Ht,type_name:yt.name,vod_name:`\u{1F4C1} ${yt.name}`,vod_pic:h,vod_remarks:yt.lastModified?q(yt.lastModified):"\u6587\u4EF6\u5939",vod_tag:"folder",cate:{id:Ht,name:yt.name}}}else{let Ht=yt.isVideo,Er=yt.isSubtitle,Tn=J(yt.size);return Ht&&(Tn="\u{1F3AC} "+Tn),Er&&(Tn="\u{1F4DD} "+Tn),{vod_id:N(yt.path,yt.name,{s:yt.size}),vod_name:yt.name,vod_pic:Ht?_:"",vod_remarks:Tn,vod_tag:Ht?"video":Er?"subtitle":"file"}}});return{page:be,pagecount:bt,limit:Ne,total:Ct,list:_t}}catch(Ce){return console.error("WebDAV\u5206\u7C7B\u5931\u8D25:",Ce.message),{page:1,pagecount:1,limit:Ne,total:0,list:[],error:Ce.message}}}async function Te(ge,ve){let Re=ge.body||{};if(!Re.id)return{list:[]};try{let be=k(Re.id),Ne=be.p||"/",Oe=be.n||"";if(Oe&&xe(Oe)){let Ze=Ne.substring(0,Ne.lastIndexOf("/"))||"/",{subtitleFiles:Ct}=await de(Ze),bt={name:Oe,path:Ne,size:Number(be.s||0)},Xt=$(bt,Ct);return{list:[{vod_id:Re.id,vod_name:ae(Oe),vod_pic:_,vod_remarks:bt.size>0?J(bt.size):"",vod_content:`\u5F53\u524D\u76EE\u5F55: ${Ze}`,vod_play_from:r.name,vod_play_url:Xt}]}}if(Oe&&ce(Oe))return{list:[{vod_id:Re.id,vod_name:Oe,vod_pic:"",vod_remarks:"\u5B57\u5E55\u6587\u4EF6",vod_play_from:r.name,vod_play_url:`${ae(Oe)}$${Re.id}`}]};let Ce=Ne,{videoFiles:ze,subtitleFiles:Dt}=await de(Ce);if(ze.length===0)return{list:[],message:"\u8BE5\u6587\u4EF6\u5939\u4E2D\u6CA1\u6709\u89C6\u9891\u6587\u4EF6"};let Qe=ne(ze),St=V(Qe,Dt),Nr=Oe===g,tr=Nr?be.t||`${K(Ce)} \u64AD\u653E\u5217\u8868`:K(Ce);return{list:[{vod_id:Re.id||N(Ce),vod_name:tr,vod_pic:Nr?y:_,vod_remarks:ze.length>1?`\u5171${ze.length}\u4E2A\u89C6\u9891`:"\u5355\u4E2A\u89C6\u9891",vod_content:`\u5F53\u524D\u76EE\u5F55: ${Ce}`,vod_play_from:r.name,vod_play_url:St}]}}catch(be){return console.error("WebDAV\u8BE6\u60C5\u5931\u8D25:",be.message),{list:[],error:be.message}}}function Ie(ge,ve,Re){let be={...ge||{}};try{if(new URL(ve).origin!==new URL(Re).origin)for(let Ne of Object.keys(be))["authorization","cookie","proxy-authorization","host"].includes(Ne.toLowerCase())&&delete be[Ne]}catch{}return be}async function $e(ge,ve){let Re=ge,be={...ve||{}};for(let Ne=0;Ne<=c;Ne+=1){let Oe=await tt({method:"GET",url:Re,headers:{...be,Range:"bytes=0-0"},responseType:"stream",maxRedirects:0,timeout:15e3,validateStatus:()=>!0});Oe.data?.destroy?.();let Ce=Number(Oe.status||0),ze=Oe.headers?.location;if(Ce>=300&&Ce<400&&ze){if(Ne===c){let St=new Error(`WebDAV\u91CD\u5B9A\u5411\u8D85\u8FC7${c}\u6B21`);throw St.retryable=!1,St}let Qe=new URL(ze,Re).toString();be=Ie(be,Re,Qe),Re=Qe;continue}if(Ce>=200&&Ce<300){let Qe=String(Oe.headers?.["content-type"]||"").toLowerCase();if(Qe.includes("application/json")||Qe.includes("text/html")){let St=new Error(`WebDAV\u8FD4\u56DE\u4E86\u975E\u5A92\u4F53\u54CD\u5E94 (${Qe||"unknown"})`);throw St.retryable=!1,St}return{url:Re,headers:be}}let Dt=new Error(`WebDAV\u5A92\u4F53\u8BF7\u6C42\u5931\u8D25 (HTTP ${Ce||"unknown"})`);throw Dt.retryable=Ce===429||Ce>=500&&Ce<=599,Dt}throw new Error("WebDAV\u91CD\u5B9A\u5411\u89E3\u6790\u5931\u8D25")}async function Ve(ge,ve){let Re;for(let be=0;be<u;be+=1)try{return await $e(ge,ve)}catch(Ne){if(Re=Ne,Ne.retryable===!1)break}throw Re||new Error("WebDAV\u5A92\u4F53\u5730\u5740\u89E3\u6790\u5931\u8D25")}async function De(ge,ve){let Re=ge.body||{};if(!Re.id)return{error:"\u7F3A\u5C11ID\u53C2\u6570"};try{let be=k(Re.id),Ne=be.p||"",Oe=be.n||"";if(Oe&&ce(Oe))return{parse:0,url:await ee(Ne,Oe),header:{},contentType:"text/plain; charset=utf-8"};let{url:ze,headers:Dt}=G(Ne),Qe=Oe.toLowerCase().endsWith(".m3u8"),St=`redirect:${ze}`,{url:Nr,headers:tr}=await w(S,"play",St,o,async()=>Ve(ze,Dt)),Ze={parse:0,url:Nr,header:tr};Qe&&(Ze.extra={format:"m3u8","User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"});let Ct=Array.isArray(be.ss)&&be.ss.length>0?be.ss.map(bt=>({path:bt?.p||"",name:bt?.n||"\u5916\u6302\u5B57\u5E55",format:bt?.e||bt?.n||"srt"})).filter(bt=>bt.path):be.sp?[{path:be.sp,name:be.sn||"\u5916\u6302\u5B57\u5E55",format:be.se||be.sn||"srt"}]:[];if(Ct.length>0)try{let bt=[];for(let _t of Ct)try{let yt=H(_t.format||_t.name),Ht=await ee(_t.path,yt);bt.push({url:Ht,name:_t.name||"\u5916\u6302\u5B57\u5E55",format:yt})}catch(yt){console.warn("[WebDAV\u64AD\u653E] \u5B57\u5E55\u52A0\u8F7D\u5931\u8D25:",yt.message)}let Xt=j(bt),Mr={...Ze.extra||{},...Xt.extra||{}};Object.assign(Ze,Xt),Object.keys(Mr).length>0&&(Ze.extra=Mr)}catch(bt){console.warn("[WebDAV\u64AD\u653E] \u5B57\u5E55\u52A0\u8F7D\u5931\u8D25:",bt.message)}return Ze}catch(be){return console.error("[WebDAV\u64AD\u653E] \u64AD\u653E\u5931\u8D25:",be.message,be.stack),{parse:0,url:"",header:{},error:"\u64AD\u653E\u5931\u8D25: "+be.message}}}async function Be(ge,ve){let Re=ge.body||{},be=(Re.wd||"").trim(),Ne=C(Re.pg||Re.page),Oe=d;if(!be)return{page:1,pagecount:1,limit:Oe,total:0,list:[]};try{let Ce=`search:${be}`,ze=await w(v,"search",Ce,s,async()=>{let Ct=`${n}${i==="/"?"":i}/SEARCH/${encodeURIComponent(be)}`,Xt=((await tt({method:"GET",url:Ct,headers:L(),timeout:3e4})).data||"").split(`
 `).map(_t=>_t.trim()).filter(Boolean),Mr=new Map;for(let _t of Xt){let yt=_t.lastIndexOf("	"),Ht,Er;yt!==-1?(Ht=_t.substring(0,yt).trim(),Er=Number.parseInt(_t.substring(yt+1).trim(),10)||0):(Ht=_t.trim(),Er=0),Ht&&(Ht=F(Ht),(!Mr.has(Ht)||Er>0)&&Mr.set(Ht,{filePath:Ht,size:Er}))}return Array.from(Mr.values())}),Dt=ze.length,Qe=Math.ceil(Dt/Oe)||1,St=(Ne-1)*Oe,tr=ze.slice(St,St+Oe).map(({filePath:Ze,size:Ct})=>{let bt=Ze.split("/").filter(Boolean).pop()||Ze,Xt=xe(bt),Mr=ce(bt),_t=Ze.endsWith("/")||Ct===0&&!Xt&&!Mr&&!Z(bt),yt=N(Ze,_t?"":bt,_t?{}:{s:Ct}),Ht={vod_id:yt,vod_name:_t?`\u{1F4C1} ${bt}`:bt,vod_pic:_t?h:Xt?_:"",vod_remarks:_t?"\u6587\u4EF6\u5939":`${Xt?"\u{1F3AC} ":Mr?"\u{1F4DD} ":""}${J(Ct)}`,vod_tag:_t?"folder":Xt?"video":Mr?"subtitle":"file"};return _t&&(Ht.type_id=yt,Ht.type_name=bt,Ht.cate={id:yt,name:bt}),Ht});return{page:Ne,pagecount:Qe,limit:Oe,total:Dt,list:tr}}catch(Ce){return console.error("[WebDAV\u641C\u7D22] \u5931\u8D25:",Ce.message),{page:Ne,pagecount:1,limit:Oe,total:0,list:[]}}}async function we(ge,ve){let Re=ge.body||{},be={server:Re.server||r.server,path:Re.path||r.path,username:Re.username||r.username,password:Re.password||r.password},Ne=ktt({...be,id:"test"});try{let Oe=null;if(await Ne.api({post(ze,Dt){ze==="/init"&&(Oe=Dt)}}),!Oe)throw new Error("WebDAV init route not registered");let Ce=await Oe({body:{}},ve);return{code:Ce.success?0:500,message:Ce.success?"\u8FDE\u63A5\u6210\u529F":Ce.error||"\u8FDE\u63A5\u5931\u8D25"}}catch(Oe){return{code:500,message:`\u8FDE\u63A5\u5931\u8D25: ${Oe.message}`}}}return{meta:{key:`webdav_${r.id}`,name:`WebDAV ${r.name}`,type:3,version:p,author:"WebDAV\u589E\u5F3A\u7248",description:"\u652F\u6301\u65E0\u9650\u5C42\u7EA7\u6D4F\u89C8\u3001\u5B57\u5E55\u5339\u914D\u3001\u591A\u65B9\u6848\u64AD\u653E\u7684WebDAV\u9A71\u52A8\u6E90",supportSearch:!0},api:async ge=>{ge.post("/init",te),ge.post("/home",le),ge.post("/category",ye),ge.post("/detail",Te),ge.post("/play",De),ge.post("/search",Be),ge.post("/test-connection",we),ge.post("/debug",async(ve,Re)=>{try{let{path:be="/"}=ve.body||{},Ne=await ie(be);return{success:!0,config:{name:r.name,server:r.server,basePath:i,hasAuth:!!r.username},currentPath:be,totalItems:Ne.length,items:Ne.slice(0,10),videoCount:Ne.filter(Oe=>Oe.isVideo).length,subtitleCount:Ne.filter(Oe=>Oe.isSubtitle).length,folderCount:Ne.filter(Oe=>Oe.isDir).length}}catch(be){return{success:!1,error:be.message,stack:be.stack}}})}}}br();var Q4r="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",SSi=6e4,TSi=/\.(mp4|mkv|avi|mov|flv|wmv|m3u8|ts|rmvb|webm|m4v|mpg|mpeg|3gp|iso)$/i,wSi="alist_tvbox",RSi="\u{1F3AC} AT",ISi=new Set(["img1.doubanio.com","img2.doubanio.com","img3.doubanio.com"]);function CSi(e,t){return e?e.startsWith("http")?e:e.startsWith("/")?`${t}${e}`:`${t}/${e}`:""}function Ptt(e,t){if(!e)return"";let r=CSi(e,t);if(!t||!r.startsWith("http"))return r;try{let n=new URL(r);return ISi.has(n.hostname)?`${t}/images?url=${r}`:r}catch{return r}}function NSi(e,t){if(!Array.isArray(e))return e;for(let r of e)!r||typeof r!="object"||(r.vod_pic?r.vod_pic=Ptt(r.vod_pic,t):r.VodPic&&(r.VodPic=Ptt(r.VodPic,t)));return e}function J4r(e){let t=e||{},r=String(t.base_url||"http://127.0.0.1:4567").replace(/\/$/,""),n=String(t.token||""),i=String(t.custom_classes||""),a=String(t.file_base_url||r.replace(/:4567(?=\/|$)/,":5678")).replace(/\/$/,""),s=`/vod1/${n}`,o=`/play/${n}`;function c(Z){return String(Z||"").replace(/\/+/g,"/")}function u(Z){let ae=c(Z);return ae.startsWith("/")?ae:`/${ae}`}function l(Z){let ae=String(Z||"");try{return decodeURIComponent(ae.replace(/\+/g,"%20"))}catch{return ae}}function x(Z){let ae=String(Z||"").trim(),fe=ae.split("$");if(fe.length<3){let H=l(ae);H!==ae&&(ae=H,fe=ae.split("$"))}return fe.length<3?null:{raw:ae,drive:fe[0],path:u(l(fe[1])),type:fe[2],parts:fe}}function d(Z){let ae=String(Z||"").trim(),fe=x(ae);return!fe||fe.type!=="1"?ae:(fe.parts[1]=fe.path,fe.parts.join("$")||ae)}function f(Z){return TSi.test(String(Z||"").split(/[?#]/)[0])}function p(Z){let ae=c(String(Z||"")).split("/").filter(Boolean);return ae[ae.length-1]||"\u64AD\u653E"}function m(Z){return u(Z).split("/").map(ae=>ae?encodeURIComponent(ae):"").join("/")}function g(Z){return Z?`${a}/d${m(Z)}`:""}function h(Z,ae){let fe=p(ae);return{vod_id:Z,vod_name:fe,vod_pic:"",vod_tag:"file",vod_remarks:"",vod_content:ae,vod_play_from:"\u4E2B\u4ED9\u5973",vod_play_url:`${fe}$${g(ae)}`}}function _(Z){return!Z||typeof Z!="object"?!1:Z.vod_tag==="folder"||Z.vod_remarks==="\u6587\u4EF6\u5939"||/folder\.png(?:$|[?#])/i.test(String(Z.vod_pic||""))}function y(Z){if(!Array.isArray(Z))return Z;for(let ae of Z){if(!_(ae))continue;let fe=d(ae.vod_id||ae.type_id);fe&&(ae.vod_id=fe,ae.type_id=fe,ae.type_name=ae.type_name||"AList\u76EE\u5F55",ae.cate=ae.cate||{})}return Z}function A(Z){return Z&&Z.list&&(y(Z.list),NSi(Z.list,r)),Z}function v(Z){return Z&&typeof Z=="object"&&!Array.isArray(Z)}function S(Z){if(!Z)return{};if(v(Z))return Z;if(typeof Z=="string")try{let ae=JSON.parse(Z);return v(ae)?ae:{}}catch{return{}}return{}}async function R(Z,ae={}){let fe={};for(let[j,ne]of Object.entries(ae||{}))ne==null||ne===""||(fe[j]=ne);return(await tt.get(`${r}${Z}`,{params:fe,timeout:SSi,headers:{"User-Agent":Q4r}})).data}function w(){if(!i)return[];try{let Z=JSON.parse(i);return Array.isArray(Z)?Z:[]}catch{return[]}}function C(Z,ae={}){return JSON.stringify({id:String(Z||"").trim(),meta:ae&&typeof ae=="object"?ae:{}})}function N(Z){try{let ae=JSON.parse(String(Z||""));if(ae&&typeof ae=="object"&&ae.id)return ae}catch{}return{id:String(Z||"").trim(),meta:{}}}function k(Z){if(!Z)return Z;let ae=String(Z).trim().replace(/[?&]sign=(&|$)/,(fe,H)=>H==="&"?"&":"");return ae=ae.replace(":5234/",":5678/"),ae}function P(Z){return/^https?:\/\//i.test(String(Z||""))}function L(Z){let ae=k(Z);if(!ae||P(ae))return ae||"";try{return new URL(ae,`${r}/`).toString()}catch{return ae}}function F(Z){if(!Z)return{};if(typeof Z=="string")try{let ae=JSON.parse(Z);return ae&&typeof ae=="object"?ae:{}}catch{return{}}return Z&&typeof Z=="object"?Z:{}}function Q(Z={}){return{"User-Agent":Q4r,Accept:"*/*","Accept-Encoding":"identity",Connection:"keep-alive",Referer:r,...Z}}async function z(Z,ae={}){if(!P(Z))return{ok:!0};try{let fe=await tt.get(Z,{timeout:15e3,responseType:"arraybuffer",maxRedirects:5,headers:{...ae,Range:"bytes=0-1023"},validateStatus:()=>!0}),H=String(fe.headers?.["content-type"]||"").toLowerCase(),j=Number(fe.status||0),ne=Buffer.isBuffer(fe.data)?fe.data.toString("utf8",0,Math.min(fe.data.length,512)):String(fe.data||"").slice(0,512),O=H.includes("json")&&/"(?:code|status)"\s*:\s*(?:4|5)\d\d|require login|failed link|proxy not allowed/i.test(ne),U=j===206||H.startsWith("video/")||H.includes("octet-stream")||H.includes("mpegurl")||H.includes("mp2t");return j>=200&&j<400&&U&&!O?{ok:!0,status:j,contentType:H}:j>=200&&j<400&&!O&&!H.includes("json")?{ok:!0,status:j,contentType:H}:{ok:!1,status:j,contentType:H,message:ne||`HTTP ${j}`}}catch(fe){return{ok:!1,message:fe.message||String(fe)}}}async function re(Z,ae){return{}}async function se(Z,ae){try{let fe=Z.body.page||1,H=await R(s,{ac:"list",pg:String(fe)}),j=w();return j.length>0&&(H.class=j),A(H),H}catch(fe){return console.error("[AListTvbox] \u9996\u9875\u83B7\u53D6\u5931\u8D25:",fe.message),{class:[],list:[]}}}async function ie(Z,ae){try{let fe=Z.body||{},H=fe.id||fe.tid||"",j=fe.page||1,ne=S(fe.extend||fe.filters||fe.ext),O=Object.keys(ne).length>0?JSON.stringify(ne):"",U=ne.sort||fe.sort||"";if(!H)return{page:1,pagecount:0,total:0,list:[]};if(ne.dir){let V=String(H).split("$"),K=c(String(ne.dir));V.length>=3&&V[2]==="1"&&(V[1]=u(K),H=V.join("$"))}let $=await R(s,{ac:"videolist",t:String(d(H)),f:O,sort:U,pg:String(j)});return A($),$}catch(fe){return console.error("[AListTvbox] \u5206\u7C7B\u83B7\u53D6\u5931\u8D25:",fe.message),{page:1,pagecount:0,total:0,list:[]}}}async function de(Z,ae){try{let fe=Z.body||{},H=fe.wd||"",j=fe.page||1;if(!H.trim())return{page:1,pagecount:0,total:0,list:[]};let ne=await R(s,{ac:"detail",wd:H,pg:String(j)});return A(ne),ne}catch(fe){return console.error("[AListTvbox] \u641C\u7D22\u5931\u8D25:",fe.message),{page:1,pagecount:0,total:0,list:[]}}}async function xe(Z,ae){try{let fe=Z.body||{},H=N(fe.id),j=d(H.id||"");if(!j)return{list:[]};let ne=await R(s,{ac:"detail",ids:j});if(ne&&Array.isArray(ne.list)&&ne.list.length===0){let O=x(j);O?.type==="1"&&f(O.path)&&(ne.list=[h(j,O.path)])}if(ne&&ne.list){y(ne.list);for(let O of ne.list)if(O.vod_pic&&(O.vod_pic=Ptt(O.vod_pic,r)),O.vod_play_from&&O.vod_play_url){let U=O.vod_play_url.split("$$$").map(V=>V.trim()).filter(Boolean),$=[];for(let V=0;V<U.length;V++){let K=U[V].split("#").map(ee=>ee.trim()).filter(Boolean),G=[];for(let ee of K)if(ee.split("$").length>=2)G.push(ee);else if(P(ee)){let J=O.vod_name||O.name||`\u7B2C${G.length+1}\u96C6`;G.push(`${J}$${ee}`)}else G.push(ee);$.push(G.join("#"))}O.vod_play_url=$.join("$$$")}}return ne||{list:[]}}catch(fe){let H=Z.body||{},j=N(H.id),ne=d(j.id||""),O=x(ne);return O?.type==="1"&&f(O.path)?{list:[h(ne,O.path)]}:(console.error("[AListTvbox] \u8BE6\u60C5\u83B7\u53D6\u5931\u8D25:",fe.message),{list:[]})}}async function ce(Z,ae){try{let fe=Z.body||{},j=N(fe.id).id||"";if(!j)return{parse:0,url:"",header:{}};if(P(j)){let G=L(j),ee=Q(),Y=await z(G,ee);return Y.ok?{parse:0,url:G,header:ee}:{parse:0,url:"",header:{},msg:`AListTvbox \u8FD4\u56DE\u7684\u76F4\u94FE\u4E0D\u53EF\u64AD\u653E\uFF1A${Y.message||Y.status||"unknown"}`}}let ne=x(j);if(ne?.type==="1"&&f(ne.path)){let G=g(ne.path),ee=Q(),Y=await z(G,ee);return Y.ok?{parse:0,url:G,header:ee}:{parse:0,url:"",header:{},msg:`AListTvbox \u8DEF\u5F84\u76F4\u94FE\u4E0D\u53EF\u64AD\u653E\uFF1A${Y.message||Y.status||"unknown"}`}}let O=await R(o,{id:j}),U=typeof O=="string"?O:O?.url||O?.playUrl||O?.play_url||"",$=L(U),V=Q(F(O?.header));if(!$)return{parse:0,url:"",header:{},msg:O?.msg||O?.message||"AListTvbox \u672A\u8FD4\u56DE\u64AD\u653E\u5730\u5740"};let K=await z($,V);return K.ok?{parse:0,url:$,header:V}:{parse:0,url:"",header:{},msg:`AListTvbox \u64AD\u653E\u5730\u5740\u4E0D\u53EF\u7528\uFF1A${K.message||K.status||"unknown"}`}}catch(fe){return console.error("[AListTvbox] \u64AD\u653E\u5730\u5740\u83B7\u53D6\u5931\u8D25:",fe.message),{parse:0,url:"",header:{}}}}return{meta:{key:wSi,name:RSi,type:3,version:"1.0.0",description:"AListTvbox",supportSearch:!0},api:async Z=>{Z.post("/init",re),Z.post("/home",se),Z.post("/category",ie),Z.post("/detail",xe),Z.post("/play",ce),Z.post("/search",de)}}}var Zde=new WeakMap;function Ltt(e,t){let r=Zde.get(e),n=new Map;for(let i of t){if(!i.externalHandlers)continue;let a=`${i.meta.type}:${i.meta.key}`,s=r?.get(a);n.set(a,i.externalIdentity&&i.externalIdentity===s?.externalIdentity?s:i)}Zde.set(e,n)}function Z4r(e,t,r){return Zde.get(e)?.get(`${t}:${r}`)}function eCr(e){Zde.delete(e)}function aa(e){return async()=>(await e()).default}function l$r(){return String(process.env.ONLY_SPIDER_KEYS||"").split(",").map(e=>e.trim()).filter(Boolean)}var c$r=[{match:["douban"],load:aa(()=>Promise.resolve().then(()=>(nCr(),rCr)))},{match:["zhuiju"],load:aa(()=>Promise.resolve().then(()=>(fCr(),dCr)))},{match:["zhuijujuhe"],load:aa(()=>Promise.resolve().then(()=>(NCr(),CCr)))},{match:["xstree_schedule"],load:async()=>(await Promise.resolve().then(()=>(qCr(),KCr))).default()},{match:["pansou"],load:aa(()=>Promise.resolve().then(()=>(y3r(),g3r)))},{match:["tgsou"],load:aa(()=>Promise.resolve().then(()=>(H3r(),V3r)))},{match:["bili_all"],load:aa(()=>Promise.resolve().then(()=>(Dfe(),Mrt)))},{match:["bili_official","bili\u5B98"],load:aa(()=>Promise.resolve().then(()=>(QNr(),XNr)))},{match:["wanoujuhe","\u73A9\u5076\u805A\u5408"],load:aa(()=>Promise.resolve().then(()=>(Q5r(),X5r)))},{match:["wouniu","\u8717\u725B"],load:aa(()=>Promise.resolve().then(()=>($nt(),xOr)))},{match:["panlian"],load:aa(()=>Promise.resolve().then(()=>(Jnt(),POr)))},{match:["filejin"],load:aa(()=>Promise.resolve().then(()=>(cpe(),xit)))},{match:["qwnull"],load:aa(()=>Promise.resolve().then(()=>(PDr(),kDr)))},{match:["jying"],load:async()=>(await Promise.resolve().then(()=>(okr(),skr))).default()},{match:["tgchannel"],load:aa(()=>Promise.resolve().then(()=>(Vkr(),jkr)))},{match:["4kzn"],load:aa(()=>Promise.resolve().then(()=>(qkr(),Kkr)))},{match:["seedhub"],load:aa(()=>Promise.resolve().then(()=>(pPr(),fPr)))},{match:["sm3"],load:aa(()=>Promise.resolve().then(()=>(APr(),_Pr)))},{match:["libvio"],load:aa(()=>Promise.resolve().then(()=>(OPr(),NPr)))},{match:["pan1"],load:async()=>(await Promise.resolve().then(()=>(ZPr(),JPr))).default()},{match:["guangyaqsxy"],load:async()=>(await Promise.resolve().then(()=>(m8r(),p8r))).default()},{match:["123qsxy"],load:async()=>(await Promise.resolve().then(()=>(Cat(),k8r))).default()},{match:["sharemount"],load:aa(()=>Promise.resolve().then(()=>(jMr(),$Mr)))},{match:["mycloud"],load:aa(()=>Promise.resolve().then(()=>(hUr(),mUr)))},{match:["88kanqiu"],load:aa(()=>Promise.resolve().then(()=>(IUr(),RUr)))},{match:["live"],load:aa(()=>Promise.resolve().then(()=>(PUr(),kUr)))},{match:["jinpai"],load:aa(()=>Promise.resolve().then(()=>(jUr(),$Ur)))},{match:["jp"],load:aa(()=>Promise.resolve().then(()=>(GUr(),qUr)))},{match:["guazi"],load:aa(()=>Promise.resolve().then(()=>(cFr(),oFr)))},{match:["hongguo"],load:async()=>(await Promise.resolve().then(()=>(vFr(),bFr))).default()},{match:["alist_tvbox"],load:e=>FHi(e,"alist_tvbox",J4r,"AListTvbox")},{match:["dudb"],load:aa(()=>Promise.resolve().then(()=>(ZFr(),JFr)))},{match:["js"],load:aa(()=>Promise.resolve().then(()=>(t$r(),e$r)))},{match:["baseset"],load:aa(()=>Promise.resolve().then(()=>(a$r(),i$r)))},{match:["push"],load:aa(()=>Promise.resolve().then(()=>(o$r(),s$r)))},{match:["youtube"],load:async()=>globalThis.lmMagnet.wrap(globalThis.lmYoutubeSite())},{match:["torrentio"],load:async()=>globalThis.lmMagnet.wrap(globalThis.lmTorrentioSite())},{match:["hdhub"],load:async()=>globalThis.lmMagnet.wrap(globalThis.lmHdhubSite())}];async function LHi(e){let t=l$r(),r=t.length>0?new Set(t):null,n=r?c$r.filter(i=>i.match.some(a=>r.has(a))):c$r;return(await Promise.all(n.map(i=>i.load(e)))).filter(Boolean)}async function x$r(){return await aa(()=>Promise.resolve().then(()=>(Dfe(),Mrt)))()}var got="20261019",MHi={meta:{key:got,name:got,type:0},api:async e=>{e.get("/",async()=>({code:0,message:`This is the ${got} spider - always last in the list`,timestamp:new Date().toISOString(),version:"1.0.0"})),e.get("/home",async()=>({code:0,list:[]})),e.get("/category",async()=>({code:0,list:[]})),e.get("/detail",async()=>({code:0,list:[]})),e.get("/play",async()=>({code:0,url:"",header:{},extra:{}})),e.get("/search",async()=>({code:0,list:[]}))},check:()=>{}};function u$r(e){return`${e}_auto_${Date.now()}_${Math.random().toString(36).slice(2)}`}function Lk(e){return`${e?.meta?.type}:${String(e?.meta?.key||"").trim()}`}function UHi(e){return`${String(e?.name||"").trim()}\0${String(e?.address||"").trim()}`}function yot(e){return Array.isArray(e)?e:[]}function BHi(e){if(!e||typeof e!="object"||e.enabled===!1)return!1;try{return["http:","https:"].includes(new URL(String(e.address||"").trim()).protocol)}catch{return!1}}async function qhe(e,t,r){let n=new Array(e.length),i=0,a=async()=>{for(;;){let o=i++;if(o>=e.length)return;n[o]=await r(e[o],o)}},s=Math.min(Math.max(1,t),e.length);return await Promise.all(Array.from({length:s},()=>a())),n}async function _ot(e,t,r,n){try{let i=await e.db.getObjectDefault(`/config/${t}`,[]);if(Array.isArray(i)&&i.length>0)return i.filter(s=>s&&s.enabled!==!1).map(s=>(s.id||(s.id=u$r(t)),r(s)));let a=e.config?.[t]||[];if(a.length>0){let s=a.map(o=>(o.id||(o.id=u$r(t)),o));return await e.db.push(`/config/${t}`,s),s.filter(o=>o.enabled!==!1).map(r)}}catch(i){console.error(`\u52A0\u8F7D ${n} \u914D\u7F6E\u5931\u8D25:`,i)}return[]}async function FHi(e,t,r,n){try{let i=await e.db.getObjectDefault(`/config/${t}`,null);if(Array.isArray(i)&&(i=i[0]||null,i?await e.db.push(`/config/${t}`,i):await e.db.delete(`/config/${t}`)),i&&typeof i=="object")return r(i);let a=e.config?.[t];if(a&&typeof a=="object"&&!Array.isArray(a))return await e.db.push(`/config/${t}`,a),r(a)}catch(i){console.error(`\u52A0\u8F7D ${n} \u914D\u7F6E\u5931\u8D25:`,i)}return null}var Khe=new WeakMap;async function yI(e){let r=(Khe.get(e.db)||Promise.resolve()).catch(()=>{}).then(()=>$Hi(e));Khe.set(e.db,r);try{return await r}finally{Khe.get(e.db)===r&&Khe.delete(e.db)}}async function $Hi(e){let t=await LHi(e);t.push(...await _ot(e,"emby",g7r,"Emby")),t.push(...await _ot(e,"alist",w7r,"Alist")),t.push(...await _ot(e,"webdav",ktt,"WebDAV"));let n=yot(await Ulr(e)).filter(p=>p&&p.enabled!==!1).map(p=>bQe(p)),i=new Set([...t,...n].map(Lk)),a=yot(await Aj(e)).filter(p=>p&&p.enabled!==!1),s=await qhe(a,2,async p=>{try{return await _j(p,{cachedOnly:!0})}catch(m){return console.error(`\u52A0\u8F7D CatPaw \u63A5\u53E3 ${p.name||p.address||""} \u5931\u8D25:`,Os(m)),null}});for(let p of s)if(p)try{let m=_lr(p);for(let g of m){let h=Lk(g);i.has(h)||(i.add(h),t.push(g))}}catch(m){console.error(`\u6CE8\u518C CatPaw \u63A5\u53E3 ${p.config?.name||""} \u5931\u8D25:`,Os(m))}let o=new Set;(await jie(await dj(e),{cachedOnly:!0,db:e.db})).forEach(p=>{let m=`${String(p?.key||"").trim()}\0${String(p?.address||"").trim()}`;if(!p?.address||o.has(m))return;o.add(m);let g=Vie(p.name,p.address,p),h=Lk(g);i.has(h)&&(g=Vie(p.name,p.address,{...p,forceHash:!0}),h=Lk(g)),!i.has(h)&&(i.add(h),t.push(g))});let u=yot(await JVe(e)).filter(BHi),l=new Set;u.forEach(p=>{let m=UHi(p);if(l.has(m))return;l.add(m);let g=rae(p.name,p.address),h=Lk(g);i.has(h)&&(g=rae(p.name,p.address,{forceHash:!0}),h=Lk(g)),!i.has(h)&&(i.add(h),t.push(g))}),t.push(...n),t.push(MHi);let x=l$r();if(x.length===0)return Ltt(e.db,t),t;let d=new Set(x),f=t.filter(p=>d.has(String(p?.meta?.key||"").trim()));return Ltt(e.db,f),f}var Ghe=async e=>(await e.db.getObjectDefault("/sites",{}))?.list||e.config.sites.list,jHi=async(e,t)=>{await e.db.push("/sites/list",t)},VHi=async e=>{await e.db.delete("/sites/list")};async function Aot(e){e.get("/list",async(t,r)=>{r.send({code:0,data:await Ghe(t.server)})}),e.put("/list",async(t,r)=>{await jHi(t.server,t.body.list),r.send({code:0})}),e.delete("/list",async(t,r)=>{await VHi(t.server),r.send({code:0})})}var HHi="/spider";function zHi(e,t){return e<10?t.video.sites:e<20?t.read.sites:e<30?t.comic.sites:e<40?t.music.sites:e<50?t.pan.sites:null}async function d$r(e){let t={video:{sites:[]},read:{sites:[]},comic:{sites:[]},music:{sites:[]},pan:{sites:[]},color:e.config?.color||[]};return(await yI(e)).forEach(n=>{let i=Object.assign({},n.meta);i.api=HHi+"/"+i.key+"/"+i.type,i.key="nodejs_"+i.key;let a=zHi(n.meta.type,t);a&&a.push(i)}),t}function f$r(e,t,{includeDisabled:r}){let n={};e.forEach(s=>n[s.key]=s);let i={},a=[];return t.forEach(s=>{let o=s.key;if(i[o]=!0,!n[o])return;let c={...n[o],name:s.name||n[o].name};r?a.push({...c,enable:s.enable,t4:s.t4,cms:s.cms}):s.enable&&a.push(c)}),e.forEach(s=>{i[s.key]||(r?a.push({...s,enable:!0,t4:s.t4,cms:s.cms}):a.push(s))}),a}function bot(e,{key:t,label:r,allowDelete:n}){e.get(`/website/${t}/config`,async i=>{try{let a=await i.server.db.getObjectDefault(`/config/${t}`,[]);return(!a||a.length===0)&&i.server.config?.[t]&&(a=i.server.config[t]),{code:0,data:a}}catch(a){return console.error(`\u83B7\u53D6 ${r} \u914D\u7F6E\u5931\u8D25:`,a),{code:1,message:"\u83B7\u53D6\u914D\u7F6E\u5931\u8D25"}}}),e.put(`/website/${t}/config`,async(i,a)=>{try{await i.server.db.push(`/config/${t}`,i.body),a.send({code:0,message:`${r}\u914D\u7F6E\u4FDD\u5B58\u6210\u529F`})}catch(s){a.send({code:1,message:"\u4FDD\u5B58\u5931\u8D25: "+s.message})}}),n&&e.delete(`/website/${t}/config`,async(i,a)=>{try{await i.server.db.delete(`/config/${t}`),a.send({code:0,message:"\u5DF2\u91CD\u7F6E\u4E3A\u9ED8\u8BA4\u914D\u7F6E"})}catch(s){a.send({code:1,message:s.message})}})}function KHi(e,{key:t,label:r}){e.get(`/website/${t}/config`,async n=>{try{let i=await n.server.db.getObjectDefault(`/config/${t}`,null);if(Array.isArray(i)&&(i=i[0]||null),!i||typeof i!="object"){let a=n.server.config?.[t];a&&typeof a=="object"&&!Array.isArray(a)?i=a:i={}}return{code:0,data:i}}catch(i){return console.error(`\u83B7\u53D6 ${r} \u914D\u7F6E\u5931\u8D25:`,i),{code:1,message:"\u83B7\u53D6\u914D\u7F6E\u5931\u8D25"}}}),e.put(`/website/${t}/config`,async(n,i)=>{try{let a=n.body||{},s={base_url:String(a.base_url||"").trim(),token:String(a.token||"").trim(),custom_classes:String(a.custom_classes||"").trim()};await n.server.db.push(`/config/${t}`,s),i.send({code:0,message:`${r}\u914D\u7F6E\u4FDD\u5B58\u6210\u529F`})}catch(a){i.send({code:1,message:"\u4FDD\u5B58\u5931\u8D25: "+a.message})}}),e.delete(`/website/${t}/config`,async(n,i)=>{try{await n.server.db.delete(`/config/${t}`),i.send({code:0,message:"\u5DF2\u91CD\u7F6E\u4E3A\u9ED8\u8BA4\u914D\u7F6E"})}catch(a){i.send({code:1,message:a.message})}})}async function vot(e){e.get("/check",async(t,r)=>{r.send({run:!e.stop,version:"1.0.0",timestamp:new Date().toISOString()})}),e.get("/config",async(t,r)=>{try{let n=await d$r(t.server),i=await Ghe(t.server);n.video.sites=f$r(n.video.sites,i,{includeDisabled:!1}),n.video.danmuSearchUrl=`http://127.0.0.1:${t.server.address().port}/website/danmu/fe`,n.video.internalDanmuUiUrl=`http://127.0.0.1:${t.server.address().port}/internal-danmu/ui`,r.send(n)}catch(n){console.error("\u83B7\u53D6\u914D\u7F6E\u5931\u8D25:",n),r.code(500).send({error:"\u83B7\u53D6\u914D\u7F6E\u5931\u8D25"})}}),e.get("/full-config",async(t,r)=>{try{let n=await d$r(t.server),i=await Ghe(t.server);n.video.sites=f$r(n.video.sites,i,{includeDisabled:!0}),r.send(n)}catch(n){console.error("\u83B7\u53D6\u5B8C\u6574\u914D\u7F6E\u5931\u8D25:",n),r.code(500).send({error:"\u83B7\u53D6\u5B8C\u6574\u914D\u7F6E\u5931\u8D25"})}}),bot(e,{key:"emby",label:"Emby",allowDelete:!1}),bot(e,{key:"alist",label:"Alist",allowDelete:!0}),bot(e,{key:"webdav",label:"WebDAV",allowDelete:!0}),KHi(e,{key:"alist_tvbox",label:"AListTvbox"})}Sr();Uie();function p$r(e){if(!e)return"";for(let t of[e,(()=>{try{return decodeURIComponent(e)}catch{return""}})()])if(t)try{let r=JSON.parse(t);if(r&&typeof r=="object")return r.url||r.base_url||r.baseUrl||r.backup_url?.[0]||r.backupUrl?.[0]||""}catch{}return""}async function qHi(e,t){try{let{do:r,url:n,referer:i,aid:a,cid:s,qn:o,video_url:c,audio_url:u,video_track:l,audio_track:x,mode:d,duration:f}=e.query;if(!r)return t.code(400).send("Invalid parameters");if(r==="mpd"){let p=await x$r(),m=c?decodeURIComponent(c):"",g=u?decodeURIComponent(u):"",h=p$r(l),_=p$r(x);for(let R of[m,g,h,_]){if(!R)continue;let w=await mw(R);if(!w.ok)return t.code(400).send(`Forbidden upstream: ${w.reason}`)}let{proxy:y}=p,[A,v,S]=await y({do:r,aid:a,cid:s,qn:o,video_url:m,audio_url:g,video_track:l,audio_track:x,mode:d||"dash",duration:f||0});return t.header("Content-Type",v).header("Access-Control-Allow-Origin","*").header("Access-Control-Expose-Headers","Content-Type,Content-Length").code(A),t.send(S)}if(r==="image"){if(!n)return t.code(400).send("missing url");let p;try{p=decodeURIComponent(n)}catch{return t.code(400).send("invalid url encoding")}let m=await mw(p);if(!m.ok)return t.code(403).send(`Forbidden upstream: ${m.reason}`);let g={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",Accept:"image/*","Accept-Language":"zh-CN,zh;q=0.9,en;q=0.8"};if(i)try{g.Referer=decodeURIComponent(i)}catch{}let h=await Se.get(p,{responseType:"stream",timeout:1e4,maxRedirects:3,headers:g});return h.headers["content-type"]&&t.header("Content-Type",h.headers["content-type"]),h.headers["content-length"]&&t.header("Content-Length",h.headers["content-length"]),h.headers["cache-control"]&&t.header("Cache-Control",h.headers["cache-control"]),t.send(h.data)}return t.code(400).send("Unsupported action")}catch(r){return console.error("\u4EE3\u7406\u9519\u8BEF:",r),t.code(500).send("Proxy error: "+r.message)}}async function Eot(e){e.get("/proxy",qHi)}Sr();var Ou=Pe(require("fs"),1),Uk=Pe(require("path"),1);or();Jf();lp();R_();DYe();var _I=P5("router.danmu.video",{maxSize:100,ttl:10*60*1e3}),bI=P5("router.danmu.episodeIndex",{maxSize:1e4,ttl:10*60*1e3}),l1=new Map,GHi=8,WHi=800,YHi=400,h$r=12*1e3,Tot=new vO(200),m$r=setInterval(()=>{let e=Date.now();for(let[t,r]of l1.entries())e-(r?.createdAt||0)>h$r*5&&l1.delete(t)},30*1e3);typeof m$r?.unref=="function"&&m$r.unref();var wot={detailRequests:0,playRequests:0,detailCacheStores:0,episodeMappingOverwriteCount:0,episodeIndexHitCount:0,episodeIndexMissCount:0,videoCacheHitCount:0,videoCacheMissCount:0,mappingRebuildCount:0,fallbackUsedCount:0,fallbackSuccessCount:0,fallbackFailedCount:0,danmakuInjectedCount:0,danmakuOverwriteCount:0,invalidTitleSkipCount:0,unrecognizedEpisodeSkipCount:0,blacklistSkipCount:0,autoPushDisabledSkipCount:0,proxyRouteSkipCount:0,nestedSpiderRouteSkipCount:0,replySentSkipCount:0,jsonParseErrorCount:0};function wa(e,t=1){Object.prototype.hasOwnProperty.call(wot,e)&&(wot[e]+=t)}function Iot(e){return(typeof e=="string"?e:String(e?.url||"")).split(/[?#]/,1)[0]}function Cot(e){let t=Iot(e),r=t.match(/^\/spider\/([^/]+)\/\d+\/(detail|play)\/?$/);return r?{spiderKey:r[1],phase:r[2],path:t}:null}function fy(e){let t=Cot(e);return t?t.spiderKey:Iot(e).match(/^\/spider\/([^/]+)\/\d+(?:\/|$)/)?.[1]||"unknown"}function g$r(e){return Cot(e)?.phase||"unknown"}function Not(e,t,r){return`${fy(e)}:${t}_${r}`}function Mk(e,t=""){if(!Xhe(e))return"";let r=e?.body||{};return`push:${String(r?.url||r?.vod_id||r?.id||r?.wd||t||"").trim()}`}function Rot(e,t=""){let r=`${String(e?.body?.flag||"")}_${String(e?.body?.id||"")}`,n=Mk(e,t);return n?`${n}:${r}`:r}function Whe(e,t=""){let r=`${String(e?.body?.flag||"")}_${String(e?.body?.id||"")}`,n=Mk(e,t);return n?`${n}:${r}`:r}function XHi(e,t=g$r(e)){let r=fy(e),n=String(e?.body?.flag||""),i=String(e?.body?.id||"");return`${r}:${n}:${i}:${t}`}function QHi(e={}){Tot.push({ts:new Date().toISOString(),...e})}function Pi(e,t={}){let r=t.phase||g$r(e);QHi({traceKey:XHi(e,r),spiderKey:fy(e),flag:String(e?.body?.flag||""),id:String(e?.body?.id||""),phase:r,status:t.status||"ok",reason:t.reason||"",...t})}function Oot(e,t,r={},n={}){let i=r.episodeKey||Not(e,e?.body?.flag,e?.body?.id);YN(t,{context:r,dedupeKey:n.dedupeKey||`enhancer:${fy(e)}:${t}:${i}`,dedupeMs:Number.isFinite(n.dedupeMs)?n.dedupeMs:15e3})}function dy(e,t,r,n={},i={}){e&&Oot(t,r,n,i)}function y$r(){let e=Tot.recent(50),t=e.reduce((i,a)=>{let s=String(a?.status||"unknown");return i[s]=(i[s]||0)+1,i},{}),r=e.reduce((i,a)=>{let s=String(a?.reason||a?.action||"unknown");return i[s]=(i[s]||0)+1,i},{}),n=Object.entries(r).sort((i,a)=>a[1]-i[1]).slice(0,10).map(([i,a])=>({reason:i,count:a}));return{cache:{videoCacheSize:_I.size,episodeIndexCacheSize:bI.size,autoPushContextSize:QQ(),pendingAutoPushTaskCount:l1.size},counters:{...wot},events:{totalBuffered:Tot.length,recentCount:e.length,statusBuckets:t,topReasons:n},recentEvents:e}}function _$r(e=""){let t=String(e||"").trim();return t?/^(https?:\/\/|magnet:\?|ed2k:\/\/)/i.test(t)||/(?:pan\.quark\.cn|pan\.baidu\.com|aliyundrive\.com|alipan\.com|115\.com|123pan\.com|cloud\.189\.cn|drive\.uc\.cn)/i.test(t):!1}function AI(e=""){let t=String(e||"").trim();return!!(!t||t==="undefined"||t==="null"||_$r(t))}function Yhe(e=0){return new Promise(t=>setTimeout(t,e))}async function JHi({maxAttempts:e=1,initialDelayMs:t=0,intervalMs:r=0}={}){let n=null,i=0,a=Date.now();t>0&&await Yhe(t);for(let s=1;s<=e;s++){i=s;try{let o=await Ii.getPlayInfo(),c=String(o?.title||"").trim();if(!AI(c))return{title:c,attempts:i,durationMs:Date.now()-a};n=new Error(`empty title on attempt ${s}`)}catch(o){n=o}s<e&&r>0&&await Yhe(r)}throw Object.assign(n||new Error("play title unavailable"),{attempts:i,durationMs:Date.now()-a})}function Xhe(e){return fy(e)==="push"}function Sot(e="",t=""){let r=String(e||"").trim(),n=String(t||"").trim();return!n||!r||r===n||_$r(r)?!1:Ms(r)!==Ms(n)}function ZHi(e,t={},r=null){let n=String(e?.body?.flag||"").trim(),i=String(e?.body?.id||"").trim(),a=String(t?.flag||"").trim(),s=String(t?.id||"").trim(),o=r||oE(),c=String(o?.flag||"").trim(),u=String(o?.id||"").trim();return a&&s?a===n&&s===i:c&&u?c===n&&u===i:!1}function l0(e,t,r={}){if(!process.env.DEBUG_PUSH_DANMU)return;let n={stage:t,spiderKey:fy(e),isPushSpider:Xhe(e),flag:String(e?.body?.flag||""),id:String(e?.body?.id||""),url:String(e?.url||""),...r};Ue.info(`[PUSH_DANMU_TRACE] ${JSON.stringify(n)}`)}function A$r(e,t,r,n="xml"){let i=oo(n);return`http://127.0.0.1:${e}/danmu-proxy?name=${encodeURIComponent(t)}&episodeNumber=${encodeURIComponent(r)}&format=${encodeURIComponent(i)}`}function b$r(e,t,r){let n=Whe(e,t),i=Ms(t);return s4t(n,{rawTitle:t,autoKey:i,episodeNumber:r.episodeNumber}),Ue.info(`[DanmuAutoPushFlow] \u5DF2\u4FDD\u5B58\u81EA\u52A8\u63A8\u9001\u4E0A\u4E0B\u6587: contextKey="${n}", autoKey="${i}"`),l0(e,"auto_push_context_saved",{contextKey:n,autoKey:i,rawTitle:t,episodeNumber:r?.episodeNumber||""}),{contextKey:n,autoKey:i}}function ezi(e,t="push_detail_reset"){if(fy(e)!=="push")return;let n=Mk(e),i=0;for(let[o]of _I.entries())String(o).startsWith("video_push_")&&(_I.delete(o),i++);let a=0;for(let[o]of bI.entries())String(o).startsWith("push:")&&(bI.delete(o),a++);let s=0;for(let[o]of l1.entries())(!n||String(o||"").startsWith(n))&&(l1.delete(o),s++);l0(e,"push_state_cleared",{reason:t,pushSessionKey:n,clearedVideoCache:i,clearedEpisodeIndex:a,clearedPendingTasks:s})}function tzi(e,{episodeKey:t,vodName:r,episodeInfo:n,port:i,playContextSnapshot:a=null,danmuFormat:s="xml"}){let o=Rot(e,r),c=Xhe(e),u=a?{...a}:null,l=String(u?.title||n?.name||r||"").trim(),x=Date.now(),d=`${o}:${x}:${Math.random().toString(36).slice(2,8)}`;l0(e,"deferred_schedule_enter",{taskKey:o,taskToken:d,episodeKey:t,pushSessionKey:Mk(e,r),autoPushContextKey:Whe(e,r),vodName:r,episodeName:n?.episodeName||"",episodeNumber:n?.episodeNumber||"",port:i,snapshotTitle:l,snapshotFlag:String(u?.flag||""),snapshotId:String(u?.id||"")}),l1.set(o,{token:d,createdAt:x,episodeKey:t,vodName:r});let f=()=>{let m=l1.get(o);return!m||m.token!==d||Date.now()-x>h$r},p=(async()=>{wa("fallbackUsedCount");try{let m="",g=null,h="",_=GHi,y=WHi,A=YHi;y>0&&await Yhe(y);for(let C=1;C<=_;C++){if(f()){Pi(e,{action:"deferred_push_cancelled",status:"skip",reason:"task_replaced_or_expired",episodeKey:t,vodName:r,taskKey:o,taskToken:d,attempt:C});return}try{let N=await Ii.getPlayInfo(),k=String(N?.title||"").trim(),P=ZHi(e,N,u),L=oE();if(l0(e,"deferred_getPlayInfo_candidate",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,candidateTitle:k,snapshotTitle:l,requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),playInfoRaw:N?JSON.stringify(N):"",playInfoFlag:String(N?.flag||""),playInfoId:String(N?.id||""),playInfoMatched:P,localContextRaw:JSON.stringify(L||{}),localFlag:String(L?.flag||""),localId:String(L?.id||""),localTitle:String(L?.title||""),localEpisodeKey:String(L?.episodeKey||""),snapshotContextRaw:JSON.stringify(u||{}),snapshotFlag:String(u?.flag||""),snapshotId:String(u?.id||"")}),!AI(k))if(c&&!P){if(!AI(l)&&!Sot(r,l)){m=l,g={attempts:C,durationMs:y+Math.max(0,C-1)*A},h="snapshot_title_on_playinfo_mismatch",l0(e,"deferred_getPlayInfo_accept",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,acceptedTitle:m,acceptReason:h,requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),playInfoRaw:N?JSON.stringify(N):"",playInfoFlag:String(N?.flag||""),playInfoId:String(N?.id||""),localContextRaw:JSON.stringify(L||{}),localFlag:String(L?.flag||""),localId:String(L?.id||""),localTitle:String(L?.title||""),snapshotContextRaw:JSON.stringify(u||{}),snapshotFlag:String(u?.flag||""),snapshotId:String(u?.id||""),snapshotTitle:l});break}l0(e,"deferred_getPlayInfo_reject_stale",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,candidateTitle:k,rejectReason:"playinfo_mismatch",requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),playInfoRaw:N?JSON.stringify(N):"",playInfoFlag:String(N?.flag||""),playInfoId:String(N?.id||""),localContextRaw:JSON.stringify(L||{}),localFlag:String(L?.flag||""),localId:String(L?.id||""),localTitle:String(L?.title||""),snapshotContextRaw:JSON.stringify(u||{}),snapshotFlag:String(u?.flag||""),snapshotId:String(u?.id||""),snapshotTitle:l}),Pi(e,{action:"deferred_push_reject_stale_title",status:"skip",reason:"playinfo_mismatch",episodeKey:t,vodName:r,taskKey:o,rawTitle:k,finalTitle:k,fallbackUsed:!0,fallbackAttempts:C})}else if(c&&Sot(r,k)){if(!AI(l)&&!Sot(r,l)){m=l,g={attempts:C,durationMs:y+Math.max(0,C-1)*A},h="snapshot_title_on_stale_playinfo",l0(e,"deferred_getPlayInfo_accept",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,acceptedTitle:m,acceptReason:h,requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),playInfoRaw:N?JSON.stringify(N):"",playInfoFlag:String(N?.flag||""),playInfoId:String(N?.id||""),localContextRaw:JSON.stringify(L||{}),localFlag:String(L?.flag||""),localId:String(L?.id||""),localTitle:String(L?.title||""),snapshotContextRaw:JSON.stringify(u||{}),snapshotFlag:String(u?.flag||""),snapshotId:String(u?.id||""),snapshotTitle:l});break}l0(e,"deferred_getPlayInfo_reject_stale",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,candidateTitle:k,rejectReason:"stale_title",requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),playInfoRaw:N?JSON.stringify(N):"",playInfoFlag:String(N?.flag||""),playInfoId:String(N?.id||""),localContextRaw:JSON.stringify(L||{}),localFlag:String(L?.flag||""),localId:String(L?.id||""),localTitle:String(L?.title||""),snapshotContextRaw:JSON.stringify(u||{}),snapshotFlag:String(u?.flag||""),snapshotId:String(u?.id||""),snapshotTitle:l}),Pi(e,{action:"deferred_push_reject_stale_title",status:"skip",reason:"stale_title",episodeKey:t,vodName:r,taskKey:o,rawTitle:k,finalTitle:k,fallbackUsed:!0,fallbackAttempts:C})}else{let F=oE();m=k||String(F?.title||"").trim(),g={attempts:C,durationMs:y+Math.max(0,C-1)*A},h=k?"playInfo_title":"local_context_title",l0(e,"deferred_getPlayInfo_accept",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,acceptedTitle:m,acceptReason:h,requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),playInfoRaw:N?JSON.stringify(N):"",playInfoFlag:String(N?.flag||""),playInfoId:String(N?.id||""),localContextRaw:JSON.stringify(F||{}),localFlag:String(F?.flag||""),localId:String(F?.id||""),localTitle:String(F?.title||"")});break}}catch(N){let k=oE();l0(e,"deferred_getPlayInfo_error",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",attempt:C,requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),localContextRaw:JSON.stringify(k||{}),localFlag:String(k?.flag||""),localId:String(k?.id||""),localTitle:String(k?.title||""),error:N?.message||String(N||"")})}C<_&&A>0&&await Yhe(A)}if(!m){let C=oE();throw l0(e,"deferred_getPlayInfo_exhausted",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",maxAttempts:_,requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||""),localContextRaw:JSON.stringify(C||{}),localFlag:String(C?.flag||""),localId:String(C?.id||""),localTitle:String(C?.title||""),exhaustedReason:"no_acceptable_title_after_max_attempts"}),Object.assign(new Error(`empty title on attempt ${_}`),{attempts:_,durationMs:y+Math.max(0,_-1)*A})}if(f()){Pi(e,{action:"deferred_push_cancelled",status:"skip",reason:"task_replaced_before_push",episodeKey:t,vodName:r,taskKey:o,taskToken:d});return}let v=String(m||"").trim();n.name=v;let S=A$r(i,v,n.episodeNumber,s);l0(e,"deferred_push_ready",{taskKey:o,taskToken:d,episodeKey:t,vodName:r,episodeNumber:n?.episodeNumber||"",finalName:v,acceptedSource:h,danmuProxyUrl:S,danmuFormat:s});let R=await Ii.pushDanmuWithStatus(S);if(!R.ok){let C=KQ(R.code);throw _0(C,{},{technicalMessage:`deferred danmu push failed: ${R.code}`,details:{bridgeCode:R.code}})}wa("fallbackSuccessCount");let{autoKey:w}=b$r(e,v,n);Ue.info(`[DanmuAutoPushFlow] \u540E\u53F0\u8865\u63A8\u5F39\u5E55\u6210\u529F: vodName="${r}", rawTitle="${v}", episodeNumber="${n.episodeNumber}", format="${s}", taskKey="${o}", danmuProxyUrl="${S}"`),Pi(e,{action:"deferred_push_success",reason:"deferred_push_success",episodeKey:t,vodName:r,rawTitle:v,finalTitle:v,episodeNumber:n.episodeNumber,autoKey:w,taskKey:o,danmuProxyUrl:S,acceptedSource:h,fallbackUsed:!0,fallbackAttempts:g?.attempts||0,fallbackDurationMs:g?.durationMs||0})}catch(m){wa("fallbackFailedCount"),Ue.error("[AutoPush] \u540E\u53F0\u8865\u63A8\u5931\u8D25:",m.message);let g=m?.danmuCode||_e.TITLE_UNRECOGNIZED;f()||Oot(e,g,{episodeKey:t,title:r,episodeNumber:n?.episodeNumber}),Pi(e,{action:"deferred_push_failed",status:"error",reason:"deferred_push_failed",episodeKey:t,vodName:r,error:m.message,taskKey:o,errorCode:g,fallbackUsed:!0,fallbackAttempts:m.attempts||0,fallbackDurationMs:m.durationMs||0,fallbackError:m.message})}finally{l1.get(o)?.token===d&&l1.delete(o)}})();Pi(e,{action:"deferred_push_scheduled",reason:"deferred_push_scheduled",episodeKey:t,vodName:r,taskKey:o,taskToken:d,episodeNumber:n.episodeNumber})}function rzi(e,t,{notifyIssues:r=!0}={}){let n;try{n=JSON.parse(t)}catch(x){return wa("jsonParseErrorCount"),Pi(e,{action:"detail_skip_json_parse_failed",status:"error",reason:"json_parse_failed",error:x.message}),dy(r,e,_e.DETAIL_RESPONSE_INVALID),t}let i=n.list?.[0];if(!i)return Pi(e,{action:"detail_skip_missing_vodInfo",status:"skip",reason:"missing_vodInfo"}),dy(r,e,_e.DETAIL_INFO_MISSING),t;if(!i.vod_play_from||!i.vod_play_url)return Pi(e,{action:"detail_skip_missing_play_fields",status:"skip",reason:"missing_play_fields",vodName:i.vod_name}),dy(r,e,_e.PLAYLIST_MISSING,{title:i.vod_name}),t;let a=String(i.vod_name||"").trim(),s=String(i.vod_danmu_name||a).trim()||a,o=fy(e);o==="push"&&ezi(e,"push_detail_enter"),l0(e,"detail_enter",{vodName:a,danmuName:s,playFrom:String(i.vod_play_from||""),playUrlPreview:String(i.vod_play_url||"").slice(0,300)});let c=`video_${o}_${a}`,u=new Map,l=i.vod_play_from.split("$$$")||[];return i.vod_play_url.split("$$$").filter(Boolean).forEach((x,d)=>{x.split("#").forEach(f=>{let[p,m]=f.split("$"),g=Not(e,l[d],m),h=bI.get(g);h&&h!==a&&(wa("episodeMappingOverwriteCount"),Ue.info(`[DanmuAutoPushFlow] \u8986\u76D6\u65E7\u5267\u96C6\u6620\u5C04: episodeKey="${g}", from="${h}", to="${a}"`),Pi(e,{action:"episode_mapping_overwrite",reason:"mapping_overwrite",episodeKey:g,vodName:a,previousVodName:h,videoCacheKey:c,mappingOverwrite:!0})),u.set(g,{name:s,episodeNumber:EC(p),episodeName:p}),l0(e,"detail_episode_mapped",{vodName:a,danmuName:s,episodeKey:g,line:l[d],episodeName:p,episodeNumber:EC(p),rawId:m}),bI.set(g,a)})}),_I.set(c,u),wa("detailCacheStores"),Ue.info(`[DanmuAutoPushFlow] \u5DF2\u7F13\u5B58\u8BE6\u60C5\u5267\u96C6\u6620\u5C04: spiderKey="${o}", vodName="${a}", episodeCount=${u.size}`),Pi(e,{action:"detail_cache_store",reason:"detail_cache_store",vodName:a,danmuName:s,videoCacheKey:c,episodeCount:u.size}),t}async function nzi(e,t,r="xml",{injectDanmu:n=!0,notifyIssues:i=n}={}){let a;try{a=JSON.parse(t)}catch(_){return wa("jsonParseErrorCount"),Pi(e,{action:"play_skip_json_parse_failed",status:"error",reason:"json_parse_failed",error:_.message}),dy(i,e,_e.PLAY_RESPONSE_INVALID),t}if(!(a.url||a.url?.length||a.urls?.length))return Pi(e,{action:"play_skip_no_media_url",status:"skip",reason:"no_media_url"}),dy(i,e,_e.MEDIA_URL_MISSING),t;let s=Not(e,e.body.flag,e.body.id),o=bI.get(s),c=fy(e);if(l0(e,"play_enter",{episodeKey:s,taskKey:Rot(e,o||""),pushSessionKey:Mk(e,o||""),autoPushContextKey:Whe(e,o||""),initialVodName:o||"",requestFlag:String(e?.body?.flag||""),requestId:String(e?.body?.id||"")}),o){wa("episodeIndexHitCount");let _=_I.get(`video_${c}_${o}`);_?.has(s)&&wa("videoCacheHitCount"),_?.has(s)||(Ue.warn(`[AutoPush] \u53D1\u73B0\u5931\u6548\u5267\u96C6\u6620\u5C04\uFF0C\u51C6\u5907\u91CD\u67E5: episodeKey=${s}, vodName=${o}`),o=null)}else wa("episodeIndexMissCount");if(!o){let _=!1;for(let[y,A]of _I.entries())if(String(y).startsWith(`video_${c}_`)&&A.has(s)){o=String(y).slice(`video_${c}_`.length),bI.set(s,o),_=!0,wa("mappingRebuildCount"),wa("videoCacheHitCount"),Ue.info(`[DanmuAutoPushFlow] \u901A\u8FC7\u89C6\u9891\u7F13\u5B58\u91CD\u5EFA\u5267\u96C6\u6620\u5C04: episodeKey="${s}", vodName="${o}"`),Pi(e,{action:"episode_mapping_rebuild",reason:"mapping_rebuild",episodeKey:s,vodName:o,videoCacheKey:y,mappingRebuilt:!0});break}_||wa("videoCacheMissCount")}if(!o)return Ue.warn(`[AutoPush] \u672A\u627E\u5230 vodName: episodeKey=${s}`),Pi(e,{action:"play_skip_missing_vodName",status:"skip",reason:"missing_vodName",episodeKey:s}),dy(i,e,_e.PLAY_CONTEXT_MISSING,{episodeKey:s}),t;let u=`video_${c}_${o}`,l=_I.get(u);if(!l)return wa("videoCacheMissCount"),Ue.warn(`[AutoPush] \u89C6\u9891\u7F13\u5B58\u7F3A\u5931: vodName=${o}, videoCacheKey=${u}`),Pi(e,{action:"play_skip_missing_videoCache",status:"skip",reason:"missing_videoCache",episodeKey:s,vodName:o,videoCacheKey:u}),dy(i,e,_e.PLAY_CONTEXT_MISSING,{episodeKey:s,title:o}),t;let x=l.get(s);if(!x)return Ue.warn(`[AutoPush] \u672A\u627E\u5230 episodeInfo: episodeKey=${s}, vodName=${o}`),Pi(e,{action:"play_skip_missing_episodeInfo",status:"skip",reason:"missing_episodeInfo",episodeKey:s,vodName:o}),dy(i,e,_e.PLAY_CONTEXT_MISSING,{episodeKey:s,title:o}),t;l0(e,"play_episode_resolved",{episodeKey:s,vodName:o,episodeName:x?.episodeName||"",episodeNumber:x?.episodeNumber||"",cachedName:x?.name||""});let d=Tur({spiderKey:c,flag:String(e?.body?.flag||""),id:String(e?.body?.id||""),episodeKey:s,vodName:String(o||""),episodeName:String(x?.episodeName||""),episodeNumber:String(x?.episodeNumber||""),title:String(x?.name||o||"")});if(l0(e,"play_context_updated",{episodeKey:s,taskKey:Rot(e,o||""),pushSessionKey:Mk(e,o||""),autoPushContextKey:Whe(e,o||""),vodName:o,localFlag:String(e?.body?.flag||""),localId:String(e?.body?.id||""),localTitle:String(x?.name||o||"")}),!n)return Pi(e,{action:"play_context_captured_without_auto_push",status:"skip",reason:"auto_push_not_allowed",episodeKey:s,vodName:o,finalTitle:String(x?.name||o||"")}),t;if(String(x?.episodeNumber||"")==="-1"&&l.size>1&&Array.from(l.values()).some(y=>String(y?.episodeNumber||"")!=="-1"))return wa("unrecognizedEpisodeSkipCount"),Pi(e,{action:"play_skip_unrecognized_episode",status:"skip",reason:"unrecognized_episode",episodeKey:s,vodName:o,episodeName:x?.episodeName||""}),dy(i,e,_e.EPISODE_UNRECOGNIZED,{episodeKey:s,title:o}),t;let f=String(x.name||"").trim(),p=Xhe(e);if(!p&&AI(f)){wa("fallbackUsedCount");try{let _=await JHi();AI(_.title)||(f=_.title,x.name=_.title,wa("fallbackSuccessCount"),Pi(e,{action:"title_fallback_success",reason:"fallback_success",episodeKey:s,vodName:o,rawTitle:_.title,finalTitle:_.title,fallbackUsed:!0,fallbackAttempts:_.attempts,fallbackDurationMs:_.durationMs}))}catch(_){wa("fallbackFailedCount"),Ue.error("[AutoPush] getPlayInfo \u83B7\u53D6\u6807\u9898\u5931\u8D25:",_.message),Pi(e,{action:"title_fallback_failed",status:"error",reason:"fallback_failed",episodeKey:s,vodName:o,error:_.message,fallbackUsed:!0,fallbackAttempts:_.attempts||0,fallbackDurationMs:_.durationMs||0,fallbackError:_.message})}}if(p||AI(f)){if(a.extra||(a.extra={}),p){l0(e,"push_clear_stale_danmaku",{episodeKey:s,vodName:o,oldDanmaku:String(a.extra.danmaku||"")});try{await Ii.clearDanmu()}catch{}a.extra.danmaku=""}return wa("invalidTitleSkipCount"),tzi(e,{episodeKey:s,vodName:o,episodeInfo:x,port:e.server.address().port,playContextSnapshot:d,danmuFormat:r}),Pi(e,{action:"play_deferred_push_pending_title",status:"skip",reason:p?"push_deferred_only":"invalid_title_deferred",episodeKey:s,vodName:o,rawTitle:f}),t}a.extra||(a.extra={}),a.extra.danmaku&&(wa("danmakuOverwriteCount"),Ue.info(`[DanmuAutoPushFlow] \u8986\u76D6\u5DF2\u6709 danmaku: episodeKey="${s}", old="${a.extra.danmaku}"`),Pi(e,{action:"danmaku_overwrite",reason:"danmaku_overwrite",episodeKey:s,vodName:o,oldDanmaku:a.extra.danmaku,overwroteExistingDanmaku:!0}));let m=e.server.address().port,g=A$r(m,f,x.episodeNumber,r);Ue.info(`[DanmuAutoPushFlow] \u6CE8\u5165\u5F39\u5E55\u4EE3\u7406: vodName="${o}", rawTitle="${f}", episodeNumber="${x.episodeNumber}", format="${r}", flag="${e.body.flag}", id="${e.body.id}", danmuProxyUrl="${g}"`),a.extra.danmaku=g,wa("danmakuInjectedCount");let{autoKey:h}=b$r(e,f,x);return Pi(e,{action:"danmaku_injected",reason:"danmaku_injected",episodeKey:s,vodName:o,rawTitle:f,finalTitle:f,episodeNumber:x.episodeNumber,autoKey:h,danmuProxyUrl:g}),JSON.stringify(a)}function Dot(e){e.addHook("onSend",async(t,r,n)=>{let i=!1;try{if(l0(t,"hook_enter",{replySent:!!r?.sent,payloadType:typeof n}),!t.url.includes("/spider/"))return Pi(t,{action:"hook_skip_non_spider",phase:"unknown",status:"skip",reason:"non_spider_route"}),n;if(t.url.includes("/proxy/"))return wa("proxyRouteSkipCount"),Pi(t,{action:"hook_skip_proxy_route",status:"skip",reason:"proxy_route"}),n;if(r.sent)return wa("replySentSkipCount"),Pi(t,{action:"hook_skip_reply_sent",status:"skip",reason:"reply_sent"}),n;let a=Cot(t);if(!a){let f=Iot(t);if(/\/(detail|play)\/?$/.test(f)){wa("nestedSpiderRouteSkipCount"),Pi(t,{action:"hook_skip_nested_spider_route",phase:"unknown",status:"skip",reason:"nested_spider_route"});try{let p=await Lf(t.server),m=fy(t),g=p?.autoPushBlacklist||[];p?.autoPush&&!g.includes(m)&&Oot(t,_e.AUTO_ROUTE_UNSUPPORTED,{},{dedupeKey:`nested-route:${m}`,dedupeMs:60*1e3})}catch(p){Ue.warn(`[DanmuAutoPushFlow] \u5D4C\u5957\u8DEF\u7531\u63D0\u793A\u51C6\u5907\u5931\u8D25: ${p.message}`)}}return n}let s=a.phase;s==="detail"&&wa("detailRequests"),s==="play"&&wa("playRequests"),i=!0;let o=await Lf(t.server),c=!!o?.autoPush,u=oo(o?.format),x=(Array.isArray(o?.autoPushBlacklist)?o.autoPushBlacklist:[]).includes(a.spiderKey),d=c&&!x;if(i=d,c||(wa("autoPushDisabledSkipCount"),Pi(t,{action:"hook_capture_context_autoPush_disabled",status:"skip",reason:"autoPush_disabled"})),x&&(wa("blacklistSkipCount"),Pi(t,{action:"hook_capture_context_blacklisted",status:"skip",reason:"blacklisted"})),s==="detail")return rzi(t,n,{notifyIssues:d});if(s==="play")return await nzi(t,n,u,{injectDanmu:d,notifyIssues:d})}catch(a){Pi(t,{action:"hook_error",status:"error",reason:"hook_error",error:a.message}),Ue.error(a),dy(i,t,_e.UNKNOWN)}return n})}var E$r="127.0.0.1",S$r=9321,izi="87654321",azi=11*1024*1024,v$r=Uk.default.resolve(process.cwd(),"runtime","danmu_api","run","danmu_api.status.json"),T$r=new Set(["LOCALCACHEVALID","REDISVALID","LOCALREDISVALID","AIVALID"]),w$r=new Set(["DEPLOYPLATFORM"]),szi=new Set([...T$r,...w$r]),ozi={LOCALCACHEVALID:"\u8BE5\u5B57\u6BB5\u4E3A\u8FD0\u884C\u72B6\u6001\uFF0C\u53EA\u8BFB\uFF1B\u672C\u5730\u7F13\u5B58\u53EF\u7528\u6027\u7531\u8FD0\u884C\u65F6\u81EA\u52A8\u63A2\u6D4B\u3002",REDISVALID:"\u8BE5\u5B57\u6BB5\u4E3A\u8FD0\u884C\u72B6\u6001\uFF0C\u53EA\u8BFB\uFF1B\u8BF7\u6539 UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN \u6765\u5F71\u54CD Redis \u8FDE\u901A\u6027\u3002",LOCALREDISVALID:"\u8BE5\u5B57\u6BB5\u4E3A\u8FD0\u884C\u72B6\u6001\uFF0C\u53EA\u8BFB\uFF1B\u8BF7\u6539 LOCAL_REDIS_URL \u6765\u5F71\u54CD\u672C\u5730 Redis \u8FDE\u901A\u6027\u3002",AIVALID:"\u8BE5\u5B57\u6BB5\u4E3A\u8FD0\u884C\u72B6\u6001\uFF0C\u53EA\u8BFB\uFF1B\u8BF7\u6539 AI_BASE_URL / AI_MODEL / AI_API_KEY \u540E\u7531\u8FD0\u884C\u65F6\u81EA\u52A8\u9A8C\u8BC1\u3002",DEPLOYPLATFORM:"\u8BE5\u5B57\u6BB5\u4E3A\u8FD0\u884C\u72B6\u6001\uFF0C\u53EA\u8BFB\uFF1B\u5F53\u524D\u503C\u7531\u90E8\u7F72\u73AF\u5883\u51B3\u5B9A\u3002"},R$r=new Set(["PROXY_URL","TMDB_API_KEY","AI_API_KEY","UPSTASH_REDIS_REST_URL","UPSTASH_REDIS_REST_TOKEN","LOCAL_REDIS_URL","DEPLOY_PLATFROM_ACCOUNT","DEPLOY_PLATFROM_PROJECT","DEPLOY_PLATFROM_TOKEN","TOKEN","ADMIN_TOKEN"]);function Jhe(e){let t=e?.config||{},r=t.danmuBuiltin?.host||E$r,n=t.danmuBuiltin?.port||S$r;return`http://${r}:${n}`}function czi(e){return(e?.config||{}).danmuBuiltin?.host||E$r}function uzi(e){return(e?.config||{}).danmuBuiltin?.port||S$r}function $h(e){return(e?.config||{}).danmuBuiltin?.token||izi}function I$r(e,t=""){let r=Jhe(e),n=$h(e),i=String(t||"").startsWith("/")?t:`/${t}`;return`${r}/${n}${i}`}var lzi=/^[A-Za-z_][A-Za-z0-9_]*$/;function Pot(e){return typeof e=="string"&&lzi.test(e)}function xzi(){let e=Uk.default.dirname(resolveInternalDanmuOverridesPath());return Ou.default.existsSync(e)||Ou.default.mkdirSync(e,{recursive:!0}),e}async function Oq(){let e=globalThis.__internalDanmuOverrideDb;if(e&&typeof e.getObjectDefault=="function")try{let r=await e.getObjectDefault("/internalDanmu/overrides",{});return r&&typeof r=="object"?r:{}}catch{return{}}let t=resolveInternalDanmuOverridesPath();if(!Ou.default.existsSync(t))return{};try{let r=Ou.default.readFileSync(t,"utf8");return r.trim()?JSON.parse(r):{}}catch{return{}}}async function C$r(e){let t=globalThis.__internalDanmuOverrideDb;if(t&&typeof t.push=="function")return await t.push("/internalDanmu/overrides",e,!0),"db:/internalDanmu/overrides";xzi();let r=resolveInternalDanmuOverridesPath();return Ou.default.writeFileSync(r,JSON.stringify(e,null,2),"utf8"),r}function dzi(e){if(typeof e!="string")return e;let t=e.trim();if(!t)return e;if(t.startsWith("[")&&t.endsWith("]")||t.startsWith("{")&&t.endsWith("}"))try{return JSON.parse(t)}catch{return e}return t==="true"?!0:t==="false"?!1:/^-?\d+(\.\d+)?$/.test(t)?Number(t):e}function Mot(e){return e==null||e===""?"":Array.isArray(e)?e.join(","):typeof e=="object"?JSON.stringify(e):String(e)}function fzi(e){let t={};if(!e||!Ou.default.existsSync(e))return t;let r=Ou.default.readFileSync(e,"utf8");for(let n of r.split(/\r?\n/)){let i=n.trim();if(!i||i.startsWith("#"))continue;let a=i.indexOf("=");a!==-1&&(t[i.slice(0,a).trim()]=i.slice(a+1))}return t}function Lot(e,t,r){if(!e||!t)return!1;let n=Uk.default.dirname(e);Ou.default.existsSync(n)||Ou.default.mkdirSync(n,{recursive:!0}),Ou.default.existsSync(e)||Ou.default.writeFileSync(e,"","utf8");let a=Ou.default.readFileSync(e,"utf8").split(/\r?\n/),s=r==null||r==="",o=Mot(r),c=!1,u=[];for(let l of a){let x=l.trim();if(!x||x.startsWith("#")){u.push(l);continue}let d=x.match(/^([^=]+)=/);if(d&&d[1].trim()===t){c=!0,s||u.push(`${t}=${o}`);continue}u.push(l)}return!s&&!c&&(u.length&&u[u.length-1]!==""&&u.push(""),u.push(`${t}=${o}`)),Ou.default.writeFileSync(e,u.join(`
