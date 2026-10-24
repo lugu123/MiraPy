@@ -282694,6 +282694,32 @@ t5lYKfpe8k83ZA==
 
   // ▸ 模块 1859 · 41 行
   }function bQe(e,t){
+  // ► engine-patch: 外部 JS 猫源崩溃隔离（见 patch_engine.py）
+  //   rtSink    安全上下文：{prefix, routes}，记录本前缀下已注册的 method+path
+  //   rtProbe   注册前探测是否已存在（避免 FST_ERR_DUPLICATED_ROUTE 把引擎拖死）
+  //   rtPreScan 脚本求值前预扫它要注册的路由，撞引擎内建路由时提前告警
+  var rtProbe=function(app,method,path,prefix){
+    var key=String(method||"").toUpperCase()+" "+(prefix||"")+path
+    var sink=app&&app.__rtRoutes
+    if(sink&&sink.routes&&sink.routes.has(key))return!0
+    try{
+      if(app&&typeof app.hasRoute==="function"&&app.hasRoute({method:String(method||"").toUpperCase(),url:path}))return!0
+    }catch(_){}
+    return!1
+  }
+  var rtMark=function(app,method,path,prefix){
+    var key=String(method||"").toUpperCase()+" "+(prefix||"")+path
+    var sink=app&&app.__rtRoutes
+    if(sink&&sink.routes)sink.routes.add(key)
+  }
+  var rtPreScan=function(src,name){
+    var builtins={"/init":1,"/home":1,"/category":1,"/detail":1,"/play":1,"/search":1,"/homeVod":1,"/selftest":1,"/admin":1,"/config":1}
+    var re=/fastify\s*\.\s*(get|post|put|delete|all)\s*\(\s*["'`]([^"'`]+)["'`]/g,m,dup=[]
+    while((m=re.exec(String(src||"")))!==null){
+      if(builtins[m[2]])dup.push(m[1].toUpperCase()+" "+m[2])
+    }
+    if(dup.length)console.warn("[js] "+name+": 脚本注册了引擎内建路由 "+dup.join("、")+"；引擎会自动跳过这些注册，建议从脚本里删掉")
+  }
     let r=Bmi(e,t),
     n=h7r(r.key||r.id||r.name||Wd.default.basename(String(r.path||r.file||"local_js"),".js")),
     i=String(r.name||n||"本地JS").trim(),
@@ -282701,6 +282727,10 @@ t5lYKfpe8k83ZA==
     configPath=`/config/js/${n}`;
     async function s(){
       return a||(a=(async()=>{
+        try{
+          let _src=await que.default.readFile(r.path||r.file,"utf8");
+          rtPreScan(_src,i)
+        }catch(_){}
         let o=await Wmi(r,i),c=typeof o==="function"?await o(i,r):o;
         return Ymi(c,{
           ...r,key:n,name:i
@@ -282823,24 +282853,76 @@ t5lYKfpe8k83ZA==
         ext:{...(r.ext||{}),configurable:!0}
       },
       api:async o=>{
-        try{
-          let mod=await s();
-          if(typeof o.addHook==="function")o.addHook("preHandler",async req=>{
-            await loadConfig(req,o)
-          });
-          installConfigRoutes(o,mod);
-          return await mod.api(o)
-        }catch(c){
-          console.error(`[js] 加载 ${i} 失败:`,c);
-          let u=async(l,x)=>x.code(500).send({code:-1,message:`JS spider 加载失败: ${c?.message||c}`});
-          o.post("/init",u),
-          o.post("/home",u),
-          o.post("/category",u),
-          o.post("/detail",u),
-          o.post("/play",u),
-          o.post("/search",u)
-        }
-      },
+  var reg=function(method,path,handler){
+    if(rtProbe(o,method,path,o&&o.prefix)){
+      console.warn("[js] "+i+": 路由 "+method.toUpperCase()+" "+path+" 与引擎内建路由重名，已跳过该条（不影响其它路由与引擎启动）")
+      return!1
+    }
+    try{
+      o[method](path,handler)
+      rtMark(o,method,path,o&&o.prefix)
+      return!0
+    }catch(err){
+      console.error("[js] "+i+": 注册 "+method.toUpperCase()+" "+path+" 失败，已跳过: ",(err&&err.message||err)+" || "+String(err&&err.stack||"").split("\n").filter(function(L){return L.indexOf("data:text/javascript")<0}).slice(1,5).join(" < "))
+      return!1
+    }
+  }
+  var bad=function(why){
+    return async function(l,x){
+      return x.code(500).send({code:-1,message:why})
+    }
+  }
+  var mod=null,loadErr=null
+  try{
+    mod=await s()
+  }catch(err){
+    loadErr=err
+    console.error("[js] 加载 "+i+" 失败:",err)
+  }
+  if(!mod){
+    // 与旧行为一致：脚本整体加载失败时，6 条标准路由回 500
+    var why0="JS spider 加载失败: "+((loadErr&&loadErr.message)||loadErr||"未知错误")
+    var u0=bad(why0)
+    reg("post","/init",u0)
+    reg("post","/home",u0)
+    reg("post","/category",u0)
+    reg("post","/detail",u0)
+    reg("post","/play",u0)
+    reg("post","/search",u0)
+    return
+  }
+  var problems=[]
+  try{
+    if(typeof o.addHook==="function")o.addHook("preHandler",async req=>{
+      await loadConfig(req,o)
+    })
+  }catch(err){
+    problems.push("preHandler 挂载失败: "+((err&&err.message)||err))
+  }
+  try{
+    installConfigRoutes(o,mod)
+  }catch(err){
+    problems.push("配置页路由失败: "+((err&&err.message)||err))
+    console.error("[js] "+i+": 配置页路由注册失败: ",err&&err.message||err)
+  }
+  try{
+    if(typeof mod.api==="function")await mod.api(o)
+    else problems.push("脚本未导出 api(fastify)")
+  }catch(err){
+    problems.push("脚本 api() 执行出错: "+((err&&err.message)||err))
+    console.error("[js] "+i+": 脚本 api() 执行出错，已隔离，引擎继续启动: ",err&&err.message||err)
+  }
+  // 兜底：脚本没注册标准路由时补占位实现，避免客户端 404
+  var missing=[]
+  ;[["post","/init"],["post","/home"],["post","/category"],["post","/detail"],["post","/play"],["post","/search"]].forEach(function(p){
+    if(!rtProbe(o,p[0],p[1],o&&o.prefix)){
+      missing.push(p[1])
+      reg(p[0],p[1],bad("JS spider 未注册 "+p[1]+(problems.length?"；"+problems.join("；"):"")))
+    }
+  })
+  if(missing.length)console.warn("[js] "+i+": 缺少标准路由 "+missing.join("、")+"，已用占位实现补上")
+  if(problems.length)console.warn("[js] "+i+": 加载完成但有异常，详情见上方日志")
+},
       check:o=>{
         s().then(c=>c.check?.(o)).catch(c=>console.error(`[js] 加载 ${i} 失败:`,c))
       }
@@ -288659,9 +288741,28 @@ ${ee.map(te=>te.name).join(`
     })).forEach(s=>{
       if(s.externalHandlers)return;
       let o=Lzi+"/"+s.meta.key+"/"+s.meta.type;
-      e.register(s.api,{
-        prefix:o
-      }),n||s.check?.(e)
+      // ► engine-patch: 每个站源单独隔离注册
+      //   1) 给 api() 的入参挂一份「本前缀已注册路由」记录，bQe 里按真实前缀探测重名
+      //   2) register() 抛错只记日志跳过这个站源，不让它把引擎拖进「每 2 秒重启」循环
+      try{
+        let __rtWrap=async function(__rtApp){
+          try{
+            if(__rtApp&&typeof __rtApp==="object")__rtApp.__rtRoutes={prefix:o,routes:new Set()}
+          }catch(_){}
+          return s.api(__rtApp)
+        };
+        e.register(__rtWrap,{
+          prefix:o
+        })
+      }catch(__rtE){
+        console.error("[js] "+String(s?.meta?.name||s?.meta?.key||"?")+": 注册站源路由失败，已跳过该站源（引擎继续启动）: ",__rtE&&__rtE.message||__rtE)
+      }
+      // check() 是启动期预探活，里面报错不能让整个站点列表注册中断
+      try{
+        n||s.check?.(e)
+      }catch(__rtC){
+        console.warn("[js] "+String(s?.meta?.name||s?.meta?.key||"?")+": check() 出错，已忽略: ",__rtC&&__rtC.message||__rtC)
+      }
     }),
     await globalThis.lmTorrentInit(e,t);
     try{
